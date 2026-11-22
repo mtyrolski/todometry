@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 from todometry.core.completions import effective_completion_mask
 from todometry.core.types import Project
 from todometry.dashboard._project_colors import resolve_project_color
+from todometry.database.dataframe import ProjectHierarchy, resolve_project_hierarchy
 
 _BACKGROUND_COLOR = "#111318"
 _TEXT_COLOR = "#e7edf5"
@@ -89,95 +90,6 @@ def _direct_completed_counts(
 
     counts = pd.Series(resolved_ids, dtype="string").value_counts()
     return {str(project_id): int(count) for project_id, count in counts.items()}
-
-
-def _project_parent_id(project: Project) -> str | None:
-    return project.project_entry.parent_id or project.project_entry.v2_parent_id
-
-
-def _preferred_project_id_for_name(
-    project_name: str, projects_by_id: dict[str, Project]
-) -> str | None:
-    matches = [
-        project
-        for project in projects_by_id.values()
-        if str(project.project_entry.name) == project_name
-    ]
-    active_matches = [project for project in matches if not project.is_archived]
-    preferred = active_matches or matches
-    if len(preferred) != 1:
-        return None
-    return str(preferred[0].id)
-
-
-def _would_create_parent_cycle(
-    project_id: str,
-    parent_id: str,
-    effective_parent_by_id: dict[str, str | None],
-) -> bool:
-    current_id: str | None = parent_id
-    visited: set[str] = set()
-    while current_id is not None and current_id not in visited:
-        if current_id == project_id:
-            return True
-        visited.add(current_id)
-        current_id = effective_parent_by_id.get(current_id)
-    return False
-
-
-def _effective_project_parents(
-    projects_by_id: dict[str, Project],
-    *,
-    project_mappings: dict[str, str] | None = None,
-    archived_parent_projects: set[str] | None = None,
-) -> tuple[dict[str, str | None], dict[str, str]]:
-    """Resolve physical parents, then apply explicit dashboard adjustments."""
-
-    effective_parent_by_id: dict[str, str | None] = {}
-    assignment_by_id: dict[str, str] = {}
-    for project_id, project in projects_by_id.items():
-        parent_id = _project_parent_id(project)
-        known_parent_id = (
-            str(parent_id)
-            if parent_id is not None and str(parent_id) in projects_by_id
-            else None
-        )
-        effective_parent_by_id[project_id] = known_parent_id
-        if known_parent_id is None:
-            assignment_by_id[project_id] = (
-                "Archived root" if project.is_archived else "Root project"
-            )
-        elif project.is_archived:
-            assignment_by_id[project_id] = "Automatic (Todoist hierarchy)"
-        else:
-            assignment_by_id[project_id] = "Todoist hierarchy"
-
-    archived_parent_projects = archived_parent_projects or set()
-    for project_id, project in projects_by_id.items():
-        if (
-            project.is_archived
-            and str(project.project_entry.name) in archived_parent_projects
-        ):
-            effective_parent_by_id[project_id] = None
-            assignment_by_id[project_id] = "Manual parent bucket"
-
-    for source_name, target_name in (project_mappings or {}).items():
-        if source_name == target_name or source_name in archived_parent_projects:
-            continue
-        target_id = _preferred_project_id_for_name(target_name, projects_by_id)
-        if target_id is None:
-            continue
-        for project_id, project in projects_by_id.items():
-            if str(project.project_entry.name) != source_name:
-                continue
-            if project_id == target_id or _would_create_parent_cycle(
-                project_id, target_id, effective_parent_by_id
-            ):
-                continue
-            effective_parent_by_id[project_id] = target_id
-            assignment_by_id[project_id] = "Manual mapping"
-
-    return effective_parent_by_id, assignment_by_id
 
 
 def _normalize_activity_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -310,29 +222,19 @@ def _select_visible_nodes(
 def _active_project_tree(
     df_completed: pd.DataFrame,
     active_projects: list[Project],
-    *,
-    project_mappings: dict[str, str] | None = None,
-    archived_parent_projects: set[str] | None = None,
+    projects_by_id: dict[str, Project],
+    hierarchy: ProjectHierarchy,
 ) -> tuple[
-    dict[str, Project],
     dict[str, list[str]],
     list[str],
     dict[str, int],
     Callable[[str], int],
-    dict[str, str],
 ]:
-    projects_by_id = {str(project.id): project for project in active_projects}
-    effective_parent_by_id, assignment_by_id = _effective_project_parents(
-        projects_by_id,
-        project_mappings=project_mappings,
-        archived_parent_projects=archived_parent_projects,
-    )
     children_by_parent: dict[str, list[str]] = defaultdict(list)
     root_ids: list[str] = []
-    for project in active_projects:
-        project_id = str(project.id)
-        parent_id = effective_parent_by_id[project_id]
-        if parent_id is None:
+    for project_id in projects_by_id:
+        parent_id = hierarchy.parents[project_id]
+        if parent_id is None or parent_id not in projects_by_id:
             root_ids.append(project_id)
             continue
         children_by_parent[parent_id].append(project_id)
@@ -360,14 +262,7 @@ def _active_project_tree(
             for child_id in children_by_parent.get(project_id, [])
         )
 
-    return (
-        projects_by_id,
-        children_by_parent,
-        root_ids,
-        direct_counts,
-        subtree_total,
-        assignment_by_id,
-    )
+    return children_by_parent, root_ids, direct_counts, subtree_total
 
 
 _EMPTY_COLOR = "#8ea3ff"
@@ -488,8 +383,7 @@ def plot_active_project_hierarchy_sunburst(
     active_projects: list[Project],
     project_colors: dict[str, str],
     *,
-    project_mappings: dict[str, str] | None = None,
-    archived_parent_projects: set[str] | None = None,
+    hierarchy: ProjectHierarchy | None = None,
 ) -> go.Figure:
     empty_message: str | None = None
     if df.empty:
@@ -507,18 +401,10 @@ def plot_active_project_hierarchy_sunburst(
     if df_completed.empty:
         return _empty_sunburst_figure("No completed tasks in the selected range")
 
-    (
-        projects_by_id,
-        children_by_parent,
-        root_ids,
-        direct_counts,
-        subtree_total,
-        assignment_by_id,
-    ) = _active_project_tree(
-        df_completed,
-        active_projects,
-        project_mappings=project_mappings,
-        archived_parent_projects=archived_parent_projects,
+    projects_by_id = {str(project.id): project for project in active_projects}
+    hierarchy = hierarchy or resolve_project_hierarchy(projects_by_id)
+    children_by_parent, root_ids, direct_counts, subtree_total = _active_project_tree(
+        df_completed, active_projects, projects_by_id, hierarchy
     )
 
     active_root_ids = [
@@ -531,18 +417,21 @@ def plot_active_project_hierarchy_sunburst(
         _HierarchyNode(
             node_id=project_id,
             parent_id="active-projects",
-            label=str(projects_by_id[project_id].project_entry.name),
+            label=hierarchy.labels[project_id],
             total_completed=subtree_total(project_id),
             direct_completed=int(direct_counts.get(project_id, 0)),
-            root_name=str(projects_by_id[project_id].project_entry.name),
+            root_name=hierarchy.labels[project_id],
             depth=1,
             kind="root",
             color=resolve_project_color(
-                projects_by_id[project_id].project_entry.name,
+                hierarchy.labels[project_id],
                 project_colors,
+                fallback=resolve_project_color(
+                    projects_by_id[project_id].project_entry.name, project_colors
+                ),
             ),
             is_archived=projects_by_id[project_id].is_archived,
-            parent_assignment=assignment_by_id[project_id],
+            parent_assignment=hierarchy.assignments[project_id],
         )
         for project_id in sorted(
             active_root_ids,
@@ -597,7 +486,7 @@ def plot_active_project_hierarchy_sunburst(
                     children_by_parent=children_by_parent,
                     subtree_total=subtree_total,
                     direct_counts=direct_counts,
-                    assignment_by_id=assignment_by_id,
+                    assignment_by_id=hierarchy.assignments,
                 )
             )
 

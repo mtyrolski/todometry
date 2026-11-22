@@ -1,9 +1,14 @@
 from pathlib import Path
 import os
 from tempfile import NamedTemporaryFile
+from threading import Lock
 
 from fastapi import HTTPException
 from omegaconf import DictConfig, OmegaConf
+
+
+# Local configuration files are shared by apps in the same process.
+configuration_write_lock = Lock()
 
 
 def read_yaml_config(path: Path, *, required: bool = True) -> DictConfig:

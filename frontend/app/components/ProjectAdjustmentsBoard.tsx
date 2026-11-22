@@ -1,41 +1,29 @@
 "use client";
 
-import { readJson } from "../lib/adminApi";
+import { readJson, requestJson } from "../lib/adminApi";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { InfoTip } from "./InfoTip";
-import { ProgressSteps } from "./ProgressSteps";
-import type { DashboardProgress } from "./ProgressSteps";
+import { ProjectMappingSetup } from "./ProjectMappingSetup";
+import type { MappingProject, ProjectRule, ProjectRulePatch } from "./ProjectMappingSetup";
 
 type ProjectAdjustmentsResponse = {
   files: string[];
   selectedFile: string;
   mappings: Record<string, string>;
   automaticMappings?: Record<string, string>;
-  mappingProvenance?: Record<string, "manual" | "automatic">;
-  mappingDetails?: Array<{
-    sourceProject: string;
-    sourceProjectId: string | null;
-    parentProject: string;
-    parentProjectId: string | null;
-    provenance: "manual" | "automatic";
-  }>;
   activeRootProjects: string[];
-  archivedRootProjects: string[];
   remappableActiveRootProjects: string[];
   archivedParentProjects: string[];
   archivedProjects: string[];
   sourceProjects: string[];
-  unmappedSourceProjects: string[];
+  projects?: MappingProject[];
+  projectMappings?: Record<string, ProjectRule>;
   warning?: string | null;
 };
 
-type ApiErrorResponse = {
-  detail?: string;
-};
-
 type Props = {
-  showWhenEmpty?: boolean;
+  setup?: { onClose: () => void };
 };
 
 const HELP_TEXT = `**Project hierarchy adjustments**
@@ -55,23 +43,52 @@ function isRetryableFetchError(message: string): boolean {
   return /invalid json response|failed to fetch|networkerror|econnrefused|socket hang up|econnreset/i.test(message);
 }
 
-export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
+async function writeAdjustments(
+  file: string,
+  changes: { projectMappings: ProjectRulePatch } | { mappings: Record<string, string>; archivedParents: string[] },
+) {
+  const qs = new URLSearchParams({ file });
+  const saved = await requestJson<{
+    saved?: boolean;
+    file?: string;
+    projectMappings?: Record<string, ProjectRule>;
+    detail?: string;
+  }>(`/api/admin/project_adjustments?${qs}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(changes),
+  }, "Could not save project mapping");
+  const rules = saved?.projectMappings;
+  if (saved?.saved !== true || saved.file !== file || !rules || typeof rules !== "object" || Array.isArray(rules)
+    || !Object.values(rules).every((rule) => typeof rule?.targetId === "string" && rule.targetId.trim()
+      && typeof rule.targetName === "string" && rule.targetName.trim())
+    || ("projectMappings" in changes && !Object.entries(changes.projectMappings).every(([id, expected]) => {
+      if (expected === null) return !Object.prototype.hasOwnProperty.call(rules, id);
+      return rules[id]?.targetId === expected.targetId && rules[id].targetName === expected.targetName;
+    }))) {
+    throw new Error(typeof saved?.detail === "string" && saved.detail.trim()
+      ? saved.detail : "Could not confirm project mapping was saved.");
+  }
+  return rules;
+}
+
+export function ProjectAdjustmentsBoard({ setup }: Props) {
   const [adjustments, setAdjustments] = useState<ProjectAdjustmentsResponse | null>(null);
-  const [adjustmentFile, setAdjustmentFile] = useState("");
   const [mappingDraft, setMappingDraft] = useState<Record<string, string>>({});
   const [archivedParentsDraft, setArchivedParentsDraft] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [loadingHint, setLoadingHint] = useState<string | null>(null);
-  const [progress, setProgress] = useState<DashboardProgress | null>(null);
   const [dragOverZone, setDragOverZone] = useState<string | null>(null);
   const [expandedBuckets, setExpandedBuckets] = useState<Record<string, boolean>>({});
+  const [guided, setGuided] = useState(false);
   const retryAttempts = useRef(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draggedProjectRef = useRef<string | null>(null);
+  const adjustmentFile = adjustments?.selectedFile ?? "";
+  const warning = !loading && !error ? adjustments?.warning : null;
 
   const loadAdjustments = useCallback(async (file?: string, refresh = false, resetRetries = false) => {
     let keepLoading = false;
@@ -85,7 +102,6 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
       }
       setLoading(true);
       setError(null);
-      setWarning(null);
       setLoadingHint("Checking archived and active projects from Todoist. Large accounts can take a few minutes.");
       const qs = new URLSearchParams();
       if (file) qs.set("file", file);
@@ -97,12 +113,8 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
         throw new Error(detail ?? "Failed to load adjustments");
       }
       setAdjustments(payload);
-      setAdjustmentFile(payload.selectedFile);
       setMappingDraft(payload.mappings ?? {});
       setArchivedParentsDraft(payload.archivedParentProjects ?? []);
-      if (payload.warning) {
-        setWarning(payload.warning);
-      }
       retryAttempts.current = 0;
       setLoadingHint(null);
     } catch (e) {
@@ -150,37 +162,6 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
       }
     };
   }, []);
-
-  useEffect(() => {
-    if (!loading) {
-      setProgress(null);
-      return;
-    }
-    const controller = new AbortController();
-    let active = true;
-
-    const loadProgress = async () => {
-      try {
-        const res = await fetch("/api/dashboard/progress", { signal: controller.signal });
-        if (!res.ok) return;
-        const payload = await readJson<DashboardProgress>(res);
-        if (!active) return;
-        setProgress(payload);
-      } catch (e) {
-        if (e && typeof e === "object" && "name" in e && (e as { name?: string }).name === "AbortError") {
-          return;
-        }
-      }
-    };
-
-    loadProgress();
-    const interval = setInterval(loadProgress, 700);
-    return () => {
-      active = false;
-      controller.abort();
-      clearInterval(interval);
-    };
-  }, [loading]);
 
   const activeRoots = useMemo(() => adjustments?.activeRootProjects ?? [], [adjustments]);
   const archivedProjects = useMemo(() => adjustments?.archivedProjects ?? [], [adjustments]);
@@ -287,23 +268,6 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
     return buckets;
   }, [activeRoots, archivedParentsDraft, mappingTargets]);
 
-  const progressDisplay = useMemo(() => {
-    if (progress?.active) return progress;
-    if (!loading) return null;
-    return {
-      active: true,
-      stage: "Building project hierarchy",
-      step: 2,
-      totalSteps: 3,
-      startedAt: null,
-      updatedAt: null,
-      detail:
-        loadingHint ??
-        "Checking archived and active Todoist projects. Large accounts can take a few minutes.",
-      error: null
-    } satisfies DashboardProgress;
-  }, [progress, loading, loadingHint]);
-
   const addParent = (name: string) => {
     if (!name || !archivedProjects.includes(name)) return;
     setMappingDraft((prev) => {
@@ -393,18 +357,9 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
       setSaving(true);
       setError(null);
       setNotice(null);
-      const qs = new URLSearchParams({ file: adjustmentFile, refresh: "false" });
-      const res = await fetch(`/api/admin/project_adjustments?${qs.toString()}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mappings: mappingDraft, archivedParents: archivedParentsDraft })
-      });
-      if (!res.ok) {
-        const payload = await readJson<ApiErrorResponse>(res);
-        throw new Error(payload.detail || "Failed to save adjustments");
-      }
+      await writeAdjustments(adjustmentFile, { mappings: mappingDraft, archivedParents: archivedParentsDraft });
       await loadAdjustments(adjustmentFile, false, true);
-      setNotice("Mappings saved. Refresh dashboard data separately when you want charts recalculated.");
+      setNotice("Mappings saved. Charts will use them the next time they load.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to save adjustments");
     } finally {
@@ -412,8 +367,30 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
     }
   };
 
-  if (!showWhenEmpty && !loading && adjustments && unmappedProjects.length === 0) {
-    return null;
+  const saveProjectRules = async (patch: ProjectRulePatch) => {
+    const projectMappings = await writeAdjustments(adjustmentFile, { projectMappings: patch });
+    setAdjustments((previous) => previous?.selectedFile === adjustmentFile ? { ...previous, projectMappings } : previous);
+    setNotice("Project mapping saved.");
+  };
+
+  if (setup || guided) {
+    const projects = adjustments?.projects ?? [];
+    const close = setup?.onClose ?? (() => setGuided(false));
+    if (!loading && projects.length) {
+      return <ProjectMappingSetup projects={projects} rules={adjustments?.projectMappings ?? {}}
+        onSave={saveProjectRules} onClose={close} cancelLabel={setup ? "Skip setup" : "Cancel"} />;
+    }
+    return (
+      <section className="card mappingSetup" aria-label="Project mapping setup">
+        <h2>Choose main projects</h2>
+        {loading ? <p role="status">Loading active and archived projects…</p>
+          : <p role="status">{error ?? warning ?? "No projects are available yet."}</p>}
+        <div className="mappingActions">
+          {!loading && <button type="button" className="button buttonSmall" onClick={() => loadAdjustments(adjustmentFile, true, true)}>Retry project list</button>}
+          <button type="button" className="button buttonSmall buttonGhost" onClick={close}>{setup ? "Skip setup" : "Cancel"}</button>
+        </div>
+      </section>
+    );
   }
 
   return (
@@ -440,6 +417,7 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
               value={adjustmentFile}
               onChange={(e) => loadAdjustments(e.target.value, false, true)}
               className="select"
+              disabled={loading || saving}
             >
               {(adjustments?.files ?? []).map((f) => (
                 <option key={f} value={f}>
@@ -449,7 +427,10 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
             </select>
           </div>
           <div className="adjustmentsHeaderButtons">
-            <button className="button buttonSmall" type="button" onClick={() => loadAdjustments(adjustmentFile, false, true)} disabled={loading}>
+            <button className="button buttonSmall" type="button" onClick={() => setGuided(true)} disabled={loading || saving}>
+              Guided setup
+            </button>
+            <button className="button buttonSmall" type="button" onClick={() => loadAdjustments(adjustmentFile, false, true)} disabled={loading || saving}>
               Refresh
             </button>
             <button className="button buttonSmall" type="button" onClick={saveAdjustments} disabled={saving || loading}>
@@ -457,7 +438,8 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
             </button>
             <button className="button buttonSmall buttonGhost" type="button" disabled={loading || !adjustments} onClick={() => {
               if (!adjustments) return;
-              const blob = new Blob([JSON.stringify({ format: "todoist-assistant-project-adjustments-v1", mappings: { ...adjustments.automaticMappings, ...adjustments.mappings }, archivedParents: adjustments.archivedParentProjects }, null, 2)], { type: "application/json" });
+              const projectMappings = adjustments.projectMappings;
+              const blob = new Blob([JSON.stringify({ format: "todoist-assistant-project-adjustments-v1", mappings: { ...adjustments.automaticMappings, ...adjustments.mappings }, archivedParents: adjustments.archivedParentProjects, ...(projectMappings && Object.keys(projectMappings).length ? { projectMappings } : {}) }, null, 2)], { type: "application/json" });
               const url = URL.createObjectURL(blob);
               const link = document.createElement("a");
               link.href = url;
@@ -477,10 +459,8 @@ export function ProjectAdjustmentsBoard({ showWhenEmpty = false }: Props) {
 
       {loading ? (
         <div className="adjustmentsLoading">
-          <ProgressSteps progress={progressDisplay} />
-          <p className="muted tiny" style={{ margin: 0 }}>
-            {loadingHint ??
-              "Checking archived and active projects. Todoist API rate limits can slow large refreshes; progress will appear above."}
+          <p className="muted tiny" role="status" style={{ margin: 0 }}>
+            {loadingHint ?? "Checking archived and active projects from Todoist."}
           </p>
           <div className="skeleton" style={{ minHeight: 180 }} />
         </div>

@@ -5,10 +5,11 @@ import shutil
 
 from todometry.core.env import EnvVar
 from todometry.core.utils import CACHE_STORAGE_REGISTRY, Cache
-from todometry.dashboard.settings import load_dashboard_config
+from todometry.dashboard.settings import resolve_dashboard_config_path
 from todometry.database.dataframe import load_adjustments_file
 from todometry.features.activity import load_activity_cache
-import todometry.web.api as web_api
+from todometry.web.api_components import dashboard_runtime, runtime
+from todometry.web.api_components.configuration import read_yaml_config
 
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "v040"
@@ -35,13 +36,21 @@ def test_v040_local_state_is_readable_and_ignored_state_is_untouched(
         assert load_adjustments_file(FIXTURE / "archived_root_projects.py") == (
             {"Legacy project": "Work"},
             [],
+            {},
         )
-        assert load_dashboard_config().urgency.enabled is True
+        assert read_yaml_config(resolve_dashboard_config_path()).urgency.enabled is True
         snapshot = Cache().dashboard_state.load()
         assert snapshot["version"] == 3
         assert snapshot["archived_projects"][0].project_entry.name == "Legacy project"
         # A v0.4.0 dashboard snapshot is a rebuildable cache, not the source of history.
-        assert web_api._load_state_from_disk_cache(demo_mode=False) is False
+        assert (
+            dashboard_runtime._load_state_from_disk_cache(
+                dashboard_runtime.DashboardState(),
+                source=runtime.sync_source(demo_mode=False),
+                cache=Cache(str(cache_dir)),
+            )
+            is False
+        )
         assert "observer_state" not in CACHE_STORAGE_REGISTRY
         assert "multiplication_label_usage" not in CACHE_STORAGE_REGISTRY
         assert {p.name: p.read_bytes() for p in cache_dir.glob("*.joblib")} == original
@@ -85,7 +94,11 @@ def test_incompatible_dashboard_snapshot_is_not_discarded(tmp_path, monkeypatch)
     monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
 
     with pytest.raises(IncompatibleCacheError):
-        web_api._load_state_from_disk_cache(demo_mode=False)
+        dashboard_runtime._load_state_from_disk_cache(
+            dashboard_runtime.DashboardState(),
+            source=runtime.sync_source(demo_mode=False),
+            cache=Cache(str(tmp_path)),
+        )
     assert path.read_bytes() == original
 
 
@@ -98,14 +111,9 @@ def test_incompatible_dashboard_snapshot_is_not_overwritten_by_refresh(
     original = _write_incompatible_cache(path, monkeypatch)
     monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
     monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
-    state = web_api._DashboardState()
-    state.df_activity = pd.DataFrame()
-    state.active_projects = []
-    state.archived_projects = []
-    state.project_colors = {}
-    monkeypatch.setattr(web_api, "_state", state)
+    snapshot = dashboard_runtime.DashboardSnapshot(df_activity=pd.DataFrame())
 
-    web_api._persist_state_to_disk_cache(demo_mode=False)
+    dashboard_runtime._persist_state_to_disk_cache(snapshot, cache=Cache(str(tmp_path)))
     assert path.read_bytes() == original
 
 
@@ -118,8 +126,8 @@ def test_incompatible_archived_scan_cache_is_not_overwritten(tmp_path, monkeypat
     monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
 
     with pytest.raises(IncompatibleCacheError):
-        web_api._call_dashboard_runtime(
-            "_save_archived_activity_scan_fingerprints", {}, {}, set()
+        dashboard_runtime._save_archived_activity_scan_fingerprints(
+            {}, {}, set(), cache=Cache(str(tmp_path))
         )
     assert path.read_bytes() == original
 
@@ -129,7 +137,7 @@ def test_refresh_does_not_hide_incompatible_activity_data(tmp_path, monkeypatch)
     from todometry.core.utils import IncompatibleCacheError
 
     class FakeDatabase:
-        def __init__(self, _path):
+        def __init__(self, _path, *, api_key):
             pass
 
         def fetch_projects_incrementally(self, _previous, _changed):
@@ -138,19 +146,25 @@ def test_refresh_does_not_hide_incompatible_activity_data(tmp_path, monkeypatch)
         def fetch_archived_projects(self):
             return []
 
-    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
-    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
-    monkeypatch.setattr(web_api, "_state", web_api._DashboardState())
-    monkeypatch.setattr(web_api, "Database", FakeDatabase)
-    monkeypatch.setattr(web_api, "_resolve_api_key", lambda: "")
-    monkeypatch.setattr(web_api, "_run_async_in_main_loop", lambda coro: coro.close())
+        def fetch_mapping_project_id_to_root(self):
+            return {}
 
-    def incompatible(_db):
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv("API_KEY", "")
+    monkeypatch.setattr(dashboard_runtime, "Database", FakeDatabase)
+
+    def incompatible(_db, *, cache, hierarchy):
         raise IncompatibleCacheError("cannot decode old activity")
 
-    monkeypatch.setattr(web_api, "load_activity_data", incompatible)
+    monkeypatch.setattr(dashboard_runtime, "load_activity_data", incompatible)
     with pytest.raises(IncompatibleCacheError, match="cannot decode old activity"):
-        web_api._call_dashboard_runtime("_refresh_state_sync", demo_mode=False)
+        dashboard_runtime._refresh_state_sync(
+            dashboard_runtime.DashboardState(),
+            source=runtime.sync_source(demo_mode=False),
+            result=None,
+        )
 
 
 def test_v040_activity_rebuilds_history_with_legacy_project_mapping(
@@ -266,9 +280,9 @@ def test_launcher_discovers_legacy_default_state(tmp_path, monkeypatch):
     assert {event.id for event in Cache(str(new / "cache")).activity.load()} == {
         "event-v040"
     }
-    assert load_adjustments_file(new / "personal/archived_root_projects.py")[0] == {
-        "Legacy project": "Work"
-    }
+    assert load_adjustments_file(
+        new / "personal/archived_root_projects.py"
+    ).mappings == {"Legacy project": "Work"}
     assert (new / "config/dashboard.yaml").read_bytes() == (
         old / "config/dashboard.yaml"
     ).read_bytes()

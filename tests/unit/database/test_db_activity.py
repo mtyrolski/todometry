@@ -1,12 +1,15 @@
 import datetime as dt
-import inspect
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from threading import Lock
+from threading import Barrier, Lock
 from time import sleep
 from unittest.mock import patch
 
+import pytest
+
 from tests.unit.database.helpers import event_payload, make_event
-from todometry.core.utils import set_tqdm_progress_callback
+from todometry.api.client import TodoistAPIClient
+from todometry.core.utils import report_tqdm_progress, set_tqdm_progress_callback
 
 ProgressCall = tuple[
     str,
@@ -33,20 +36,28 @@ def test_fetch_activity_adaptively_empty_windows(_mock_logger, db_activity):
     assert mock_fetch_window.call_count == 2
 
 
-@patch("todometry.database.db_activity.logger")
-def test_fetch_activity_adaptively_does_not_cap_pages_by_window_size(
-    _mock_logger, db_activity
-):
-    with patch.object(db_activity, "_fetch_activity_range") as mock_fetch_window:
-        mock_fetch_window.side_effect = [[], []]
+@patch.object(TodoistAPIClient, "request_json")
+def test_fetch_activity_adaptively_reads_every_page_in_a_window(request_json, db_activity):
+    request_json.side_effect = [
+        {
+            "results": [event_payload("first", event_date="2024-01-07T12:00:00Z")],
+            "next_cursor": "page-two",
+        },
+        {
+            "results": [event_payload("second", event_date="2024-01-06T12:00:00Z")],
+            "next_cursor": None,
+        },
+        {"results": [], "next_cursor": None},
+    ]
+    events = db_activity.fetch_activity_adaptively(
+        nweeks_window_size=1,
+        early_stop_after_n_windows=1,
+        date_to=datetime(2024, 1, 8, tzinfo=timezone.utc),
+        max_workers=1,
+    )
 
-        db_activity.fetch_activity_adaptively(
-            nweeks_window_size=10,
-            early_stop_after_n_windows=2,
-        )
-
-    first_call_kwargs = mock_fetch_window.call_args_list[0].kwargs
-    assert first_call_kwargs["max_pages"] is None
+    assert [event.id for event in events] == ["first", "second"]
+    assert request_json.call_count == 3
 
 
 @patch("todometry.database.db_activity.logger")
@@ -71,7 +82,10 @@ def test_fetch_activity_adaptively_checkpoints_each_completed_window(
 ):
     first_event = make_event("event1")
     second_event = make_event("event2")
-    checkpoints: list[set] = []
+    checkpoints: list[tuple[datetime, datetime, set]] = []
+
+    def checkpoint(start, end, events):
+        checkpoints.append((start, end, events))
 
     with patch.object(db_activity, "_fetch_activity_range") as mock_fetch_window:
         mock_fetch_window.side_effect = [[first_event], [second_event], []]
@@ -79,10 +93,16 @@ def test_fetch_activity_adaptively_checkpoints_each_completed_window(
         db_activity.fetch_activity_adaptively(
             nweeks_window_size=1,
             early_stop_after_n_windows=1,
-            on_events=checkpoints.append,
+            on_window=checkpoint,
         )
 
-    assert checkpoints == [{first_event}, {second_event}]
+    assert [events for _, _, events in checkpoints] == [
+        {first_event},
+        {second_event},
+        set(),
+    ]
+    assert checkpoints[0][0] == checkpoints[1][1]
+    assert checkpoints[1][0] == checkpoints[2][1]
 
 
 @patch("todometry.database.db_activity.logger")
@@ -166,7 +186,7 @@ def test_fetch_activity_adaptively_reports_verbose_window_detail(
     assert any("empty windows=" in detail for detail in details)
 
 
-@patch("todometry.database.db_activity.TodoistAPIClient.request_json")
+@patch.object(TodoistAPIClient, "request_json")
 def test_fetch_activity_range_reports_page_progress(mock_request_json, db_activity):
     mock_request_json.return_value = {"results": [], "next_cursor": None}
     progress_calls: list[tuple[str, int, int, str | None]] = []
@@ -190,7 +210,7 @@ def test_fetch_activity_range_reports_page_progress(mock_request_json, db_activi
     )
 
 
-@patch("todometry.database.db_activity.TodoistAPIClient.request_json")
+@patch.object(TodoistAPIClient, "request_json")
 def test_fetch_activity_range_continues_past_cached_page_to_backfill_gaps(
     mock_request_json, db_activity
 ):
@@ -243,7 +263,7 @@ def test_fetch_activity_range_continues_past_cached_page_to_backfill_gaps(
     assert mock_request_json.call_count == 3
 
 
-@patch("todometry.database.db_activity.TodoistAPIClient.request_json")
+@patch.object(TodoistAPIClient, "request_json")
 def test_fetch_activity_range_filters_by_parent_project_id(
     mock_request_json, db_activity
 ):
@@ -386,51 +406,119 @@ def test_fetch_activity_for_parent_projects_runs_projects_in_parallel_and_report
     assert any(detail is not None and "workers=2" in detail for detail in details)
 
 
-def test_fetch_activity_signature(db_activity):
-    signature = inspect.signature(db_activity.fetch_activity)
-    params = list(signature.parameters)
+def test_parallel_scans_keep_worker_progress_in_the_calling_context(db_activity):
+    worker_ready = Barrier(2)
 
-    assert "max_pages" in params
-    assert "starting_page" in params
-    assert signature.parameters["max_pages"].default == 4
-    assert signature.parameters["starting_page"].default == 0
+    def fetch_window(*, progress_desc, **_kwargs):
+        worker_ready.wait(timeout=5)
+        report_tqdm_progress(progress_desc, 1, 1, "page")
+        return []
 
+    def collect_pages(scan, *args, **kwargs):
+        pages = []
 
-def test_fetch_activity_incremental_uses_previous_calendar_day_overlap(db_activity):
-    cached = make_event(
-        "known-event",
-        date=dt.datetime(2026, 10, 2, 18, 45, tzinfo=timezone.utc),
-        event_date="2026-10-02T18:45:00Z",
-    )
-    new_event = make_event("new-event")
+        def capture(desc, _current, _total, unit, *_details):
+            if unit == "page":
+                pages.append(desc)
 
-    with patch.object(
-        db_activity, "_fetch_activity_range", return_value=[new_event]
-    ) as fetch_range:
-        result = db_activity.fetch_activity_incremental(
-            {cached},
-            date_to=datetime(2026, 10, 3, 10, tzinfo=timezone.utc),
+        set_tqdm_progress_callback(capture)
+        try:
+            scan(*args, **kwargs)
+        finally:
+            set_tqdm_progress_callback(None)
+        return pages
+
+    with (
+        patch.object(db_activity, "_fetch_activity_range", side_effect=fetch_window),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        adaptive = executor.submit(
+            collect_pages,
+            db_activity.fetch_activity_adaptively,
+            nweeks_window_size=1,
+            early_stop_after_n_windows=1,
+            progress_desc="Activity history",
+        )
+        archived = executor.submit(
+            collect_pages,
+            db_activity.fetch_activity_for_parent_projects,
+            ["parent"],
+            date_from=datetime(2024, 1, 1, tzinfo=dt.UTC),
+            date_to=datetime(2024, 1, 8, tzinfo=dt.UTC),
+            window_weeks=1,
+            progress_desc="Archived activity",
         )
 
-    assert result == [new_event]
-    assert fetch_range.call_args.kwargs["date_from"] == datetime(
-        2026, 10, 1, tzinfo=timezone.utc
+        assert adaptive.result(timeout=10) == ["Activity history"]
+        assert archived.result(timeout=10) == ["Archived activity"]
+
+
+@patch.object(TodoistAPIClient, "request_json")
+def test_first_activity_sync_reads_through_cursor_exhaustion(request_json, db_activity):
+    request_json.side_effect = [
+        {"results": [event_payload("one")], "next_cursor": "page-two"},
+        {"results": [], "next_cursor": "page-three"},
+        {"results": [event_payload("two")], "next_cursor": "page-four"},
+        {"results": [event_payload("three")], "next_cursor": None},
+    ]
+
+    events = db_activity.fetch_activity_incremental(
+        set(), date_from=None, date_to=datetime(2026, 11, 20, tzinfo=timezone.utc)
     )
-    assert fetch_range.call_args.kwargs["date_to"] == datetime(
-        2026, 10, 3, 10, tzinfo=timezone.utc
+
+    assert [event.id for event in events] == ["one", "two", "three"]
+    params = [call.args[0].params for call in request_json.call_args_list]
+    assert [page.get("cursor") for page in params] == [
+        None,
+        "page-two",
+        "page-three",
+        "page-four",
+    ]
+    assert all(
+        "date_from" not in page and page["date_to"] == "2026-11-20T00:00:00Z"
+        for page in params
     )
-    assert fetch_range.call_args.kwargs["events_already_fetched"] == {cached}
 
 
-def test_fetch_activity_incremental_falls_back_without_cached_boundary(db_activity):
-    event = make_event("new-event")
-    with patch.object(
-        db_activity, "fetch_activity_recent", return_value=[event]
-    ) as fetch_recent:
-        result = db_activity.fetch_activity_incremental(set())
+@patch.object(TodoistAPIClient, "request_json")
+def test_activity_sync_rejects_cursor_cycles(request_json, db_activity):
+    request_json.side_effect = [
+        {"results": [], "next_cursor": "first"},
+        {"results": [], "next_cursor": "second"},
+        {"results": [], "next_cursor": "first"},
+    ]
 
-    assert result == [event]
-    fetch_recent.assert_called_once_with(max_pages=2)
+    with pytest.raises(RuntimeError, match="repeated an activity pagination cursor"):
+        db_activity.fetch_activity_incremental(
+            set(), date_from=None, date_to=datetime(2026, 11, 20, tzinfo=timezone.utc)
+        )
+
+    assert request_json.call_count == 3
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"results": []}, "invalid activity pagination cursor"),
+        (
+            {
+                "results": [event_payload("broken", event_date="invalid")],
+                "next_cursor": None,
+            },
+            "invalid activity timestamp",
+        ),
+    ],
+)
+@patch.object(TodoistAPIClient, "request_json")
+def test_activity_sync_rejects_incomplete_pages(
+    request_json, db_activity, payload, message
+):
+    request_json.return_value = payload
+
+    with pytest.raises(RuntimeError, match=message):
+        db_activity.fetch_activity_incremental(
+            set(), date_from=None, date_to=datetime(2026, 11, 20, tzinfo=timezone.utc)
+        )
 
 
 def test_activity_timestamps_with_offsets_are_stored_as_naive_utc():
@@ -453,8 +541,3 @@ def test_activity_timestamps_with_offsets_are_stored_as_naive_utc():
     events = DatabaseActivity._events_from_entries([entry])
     assert events[0].date == datetime(2026, 11, 1, 23, 30)
     assert events[0].date.tzinfo is None
-
-
-def test_fetch_activity_short_circuits_for_zero_pages(db_activity):
-    result = db_activity.fetch_activity(max_pages=0)
-    assert result == []

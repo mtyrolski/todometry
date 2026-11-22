@@ -345,37 +345,33 @@ def evaluate_urgency_status(
     )
 
 
+def _utc_activity_index(values: pd.Index | pd.Series) -> pd.DatetimeIndex:
+    # Old snapshots can mix naive UTC values with offset-aware timestamps.
+    parsed = pd.to_datetime(values, errors="coerce", format="mixed", utc=True)
+    return pd.DatetimeIndex(parsed, name=values.name).tz_localize(None)
+
+
 def normalize_activity_df(df_activity) -> pd.DataFrame:
     if not isinstance(df_activity, pd.DataFrame):
         return empty_activity_df()
 
     normalized = df_activity.copy()
-    if normalized.empty:
-        if "date" in normalized.columns:
-            normalized["date"] = pd.to_datetime(normalized["date"], errors="coerce")
-            return cast(pd.DataFrame, normalized.set_index("date", drop=False))
-        normalized.index = pd.to_datetime(normalized.index, errors="coerce")
-        return normalized
-
-    if "date" in normalized.columns:
-        date_values = pd.to_datetime(normalized["date"], errors="coerce")
-        valid_date_values = int(date_values.notna().sum())
-        if not isinstance(normalized.index, pd.DatetimeIndex) or valid_date_values > 0:
+    date_index = None
+    date_column = normalized.get("date")
+    if isinstance(date_column, pd.Series):
+        date_values = _utc_activity_index(date_column)
+        if (
+            normalized.empty
+            or not isinstance(normalized.index, pd.DatetimeIndex)
+            or date_values.notna().any()
+        ):
             normalized["date"] = date_values
-            normalized = cast(
-                pd.DataFrame,
-                normalized[date_values.notna()].set_index("date", drop=False),
-            )
-    else:
-        normalized.index = pd.to_datetime(normalized.index, errors="coerce")
-        normalized = cast(pd.DataFrame, normalized[~pd.isna(normalized.index)])
+            date_index = date_values
 
-    if not isinstance(normalized.index, pd.DatetimeIndex):
-        normalized.index = pd.to_datetime(normalized.index, errors="coerce")
-        normalized = cast(pd.DataFrame, normalized[~pd.isna(normalized.index)])
-
-    normalized_df = cast(pd.DataFrame, normalized)
-    return cast(pd.DataFrame, normalized_df.sort_index())
+    if date_index is None:
+        date_index = _utc_activity_index(normalized.index)
+    normalized.index = date_index
+    return cast(pd.DataFrame, normalized.loc[date_index.notna()].sort_index())
 
 
 def period_bounds(df_activity, granularity: str) -> dict[str, Any]:
@@ -489,38 +485,6 @@ def compute_plot_history_beg(
     if first_dt is None:
         return fallback
     return max(first_dt, fallback)
-
-
-def apply_date_axis_viewport(
-    fig: go.Figure,
-    *,
-    beg: datetime,
-    end: datetime,
-    rangeslider: bool = True,
-) -> go.Figure:
-    """Keep the plotted history available while opening on the selected viewport."""
-
-    slider = (
-        {
-            "visible": True,
-            "thickness": 0.08,
-            "bgcolor": "rgba(255,255,255,0.05)",
-            "bordercolor": "rgba(255,255,255,0.14)",
-            "borderwidth": 1,
-        }
-        if rangeslider
-        else {"visible": False}
-    )
-    fig.update_xaxes(
-        range=[beg, end],
-        rangeslider=slider,
-        type="date",
-        fixedrange=False,
-    )
-    fig.update_layout(
-        uirevision=f"{beg.isoformat()}:{end.isoformat()}",
-    )
-    return fig
 
 
 def normalize_plot_events(config: Mapping[str, Any] | None) -> list[dict[str, str]]:
@@ -642,6 +606,24 @@ def empty_activity_df() -> pd.DataFrame:
     return df.set_index("date")
 
 
+def compute_custom_plot_range(beg: str, end: str) -> tuple[datetime, datetime]:
+    beg_dt = parse_yyyy_mm_dd(beg)
+    try:
+        end_dt = parse_yyyy_mm_dd(end) + timedelta(days=1)
+    except OverflowError as exc:
+        raise HTTPException(
+            status_code=400, detail="Date range end is too late"
+        ) from exc
+    if end_dt <= beg_dt:
+        raise HTTPException(status_code=400, detail="end must be after beg")
+    if end_dt - beg_dt > timedelta(weeks=MAX_PLOT_HISTORY_WEEKS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Date range must be <= {MAX_PLOT_HISTORY_WEEKS} weeks",
+        )
+    return beg_dt, end_dt
+
+
 def compute_plot_range(
     df_activity,
     *,
@@ -649,22 +631,13 @@ def compute_plot_range(
     beg: str | None,
     end: str | None,
 ) -> tuple[datetime, datetime]:
-    df_activity = normalize_activity_df(df_activity)
     if (beg is None) ^ (end is None):
         raise HTTPException(
             status_code=400, detail="Provide both beg and end, or neither"
         )
 
     if beg is not None and end is not None:
-        beg_dt = parse_yyyy_mm_dd(beg)
-        end_dt = parse_yyyy_mm_dd(end) + timedelta(days=1)
-        if end_dt <= beg_dt:
-            raise HTTPException(status_code=400, detail="end must be after beg")
-        if (end_dt - beg_dt) > timedelta(weeks=260):
-            raise HTTPException(
-                status_code=400, detail="Date range must be <= 260 weeks"
-            )
-        return beg_dt, end_dt
+        return compute_custom_plot_range(beg, end)
 
     if weeks < 1 or weeks > 260:
         raise HTTPException(status_code=400, detail="weeks must be between 1 and 260")

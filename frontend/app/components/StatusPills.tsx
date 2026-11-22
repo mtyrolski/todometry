@@ -2,7 +2,7 @@
 
 type Tone = "good" | "warn" | "neutral";
 
-export type StatusPill = {
+type StatusPill = {
   key?: string;
   label: string;
   tone?: Tone;

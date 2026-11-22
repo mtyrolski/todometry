@@ -111,12 +111,14 @@ class TodoistAPIClient:
     def __init__(
         self,
         *,
+        api_key: str | None = None,
         default_timeout: TimeoutSettings | None = None,
         max_requests_per_minute: int | None = DEFAULT_MAX_REQUESTS_PER_MINUTE,
         max_attempts: int = RETRY_MAX_ATTEMPTS,
         backoff_mean: float = RETRY_BACKOFF_MEAN,
         backoff_std: float = RETRY_BACKOFF_STD,
     ) -> None:
+        self._api_key = api_key
         self._session_local = local()
         self._default_timeout = default_timeout or TimeoutSettings()
         self._max_requests_per_minute = (
@@ -269,8 +271,9 @@ class TodoistAPIClient:
     def _build_headers(
         self, headers: Optional[Mapping[str, str]]
     ) -> MutableMapping[str, str]:
+        api_key = get_api_key() if self._api_key is None else self._api_key
         merged: MutableMapping[str, str] = CaseInsensitiveDict(
-            {"Authorization": f"Bearer {get_api_key()}"}
+            {"Authorization": f"Bearer {api_key}"}
         )
         if headers:
             merged.update(headers)
@@ -347,3 +350,15 @@ class TodoistAPIClient:
             except (TypeError, ValueError):
                 return None
         return None
+
+
+class TodoistConnection:
+    """Give a database and its operations one client for the selected account."""
+
+    def __init__(self, *, api_key: str | None = None) -> None:
+        super().__init__()
+        self._api_client = TodoistAPIClient(api_key=api_key)
+
+    @property
+    def last_call_details(self) -> EndpointCallResult | None:
+        return self._api_client.last_call_result

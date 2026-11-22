@@ -23,7 +23,7 @@ export const NUMBER_FIELDS = [
   { key: "warnDeadlineWithinDays", label: "Deadline within days", min: 0 },
   { key: "warnDeadlineMinCount", label: "Minimum deadline matches", min: 1 }
 ] as const;
-export type NumberKey = typeof NUMBER_FIELDS[number]["key"];
+type NumberKey = typeof NUMBER_FIELDS[number]["key"];
 export type SettingsDraft = Omit<DashboardSettings, NumberKey> & Record<NumberKey, string>;
 
 export function settingsDraft(settings: DashboardSettings): SettingsDraft {

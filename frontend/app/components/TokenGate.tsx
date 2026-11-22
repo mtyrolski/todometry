@@ -3,6 +3,12 @@
 import { readJson } from "../lib/adminApi";
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
+import dynamic from "next/dynamic";
+
+const InitialProjectMapping = dynamic(
+  () => import("./ProjectAdjustmentsBoard").then((module) => module.ProjectAdjustmentsBoard),
+  { ssr: false },
+);
 
 type TokenStatus = {
   configured: boolean;
@@ -22,6 +28,7 @@ export function TokenGate({ children }: { children: ReactNode | ((state: TokenGa
   const [tokenDraft, setTokenDraft] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [mappingSetup, setMappingSetup] = useState(false);
 
   const refreshStatus = async () => {
     setChecking(true);
@@ -71,6 +78,7 @@ export function TokenGate({ children }: { children: ReactNode | ((state: TokenGa
       setStatus(payload);
       setTokenDraft("");
       setReady(true);
+      setMappingSetup(true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Failed to save token");
     } finally {
@@ -78,13 +86,19 @@ export function TokenGate({ children }: { children: ReactNode | ((state: TokenGa
     }
   };
 
-  const setupActive = !ready;
+  const setupActive = !ready || mappingSetup;
   const renderedChildren = typeof children === "function" ? children({ setupActive, tokenReady: ready }) : children;
 
   return (
     <>
       {renderedChildren}
-      {setupActive ? (
+      {mappingSetup ? (
+        <div className="setupOverlay" role="dialog" aria-modal="true" aria-label="Project mapping">
+          <div className="setupPanel">
+            <InitialProjectMapping setup={{ onClose: () => setMappingSetup(false) }} />
+          </div>
+        </div>
+      ) : !ready ? (
         <div className="setupOverlay" role="dialog" aria-modal="true" aria-live="polite">
           <div className="setupPanel">
             <header className="setupHeader">

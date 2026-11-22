@@ -88,7 +88,7 @@ public class PlotDataTest {
     assertEquals("New name", child.getString("name"));
     assertEquals("root", child.getString("parentId"));
     assertEquals("metadata", child.getString("createdAtSource"));
-    assertEquals(2, child.getInt("openTasks"));
+    assertEquals(2, model.tasks.stream().filter(task -> task.projectId.equals("child")).count());
     assertEquals(3, child.getJSONArray("dailyEvents").length());
     assertEquals(1, child.getJSONArray("dailyCompletions").length());
     assertEquals(1, row(child.getJSONArray("dailyCompletions"), "2026-10-22").getInt("count"));
@@ -97,7 +97,6 @@ public class PlotDataTest {
     assertTrue(child.getBoolean("metadataKnown"));
     assertEquals(1, project(hierarchy, "lost").getJSONArray("dailyEvents").length());
     assertEquals("unknown", project(hierarchy, "empty").getString("createdAtSource"));
-    assertEquals("2026-10-28", project(hierarchy, "archived").getString("updatedAt"));
     assertEquals("", project(hierarchy, "archived").getString("archivedAt"));
     JSONArray payloadTasks = MobilePayload.model(model).getJSONArray("tasks");
     for (int i = 0; i < payloadTasks.length(); i++)

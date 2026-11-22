@@ -1332,21 +1332,22 @@ public class SyncLifecycleTest {
             .getString("Old"));
     assertTrue(file.delete());
     CountDownLatch edited = new CountDownLatch(1);
+    AtomicReference<String> saveError = new AtomicReference<>();
+    AtomicReference<DashboardViewModel.State> savedState = new AtomicReference<>();
     InstrumentationRegistry.getInstrumentation()
         .runOnMainSync(
-            () -> {
-              model.state().removeObserver(observer);
-              observer =
-                  value -> {
-                    state.set(value);
-                    if (value.message.equals("Project adjustments saved.")) edited.countDown();
-                  };
-              model.state().observeForever(observer);
-              model.saveAdjustments(
-                  "{\"format\":\"todoist-assistant-project-adjustments-v1\",\"mappings\":{\"Old\":\"Work\",\"Missing\":\"Unknown"
-                      + " root\"},\"archivedParents\":[\"Another archive\"]}");
-            });
+            () ->
+                model.saveAdjustments(
+                    "{\"format\":\"todoist-assistant-project-adjustments-v1\",\"mappings\":{\"Old\":\"Work\",\"Missing\":\"Unknown"
+                        + " root\"},\"archivedParents\":[\"Another archive\"]}",
+                    error -> {
+                      saveError.set(error);
+                      savedState.set(state.get());
+                      edited.countDown();
+                    }));
     assertTrue(edited.await(10, TimeUnit.SECONDS));
+    assertNull(saveError.get());
+    assertFalse(savedState.get().loading);
     JSONObject persisted =
         new SnapshotStore(context).load("fake-test-token").getJSONObject("adjustments");
     assertEquals("Work", persisted.getJSONObject("mappings").getString("Old"));
@@ -1354,7 +1355,7 @@ public class SyncLifecycleTest {
     assertEquals("Another archive", persisted.getJSONArray("archivedParents").getString(0));
     assertEquals(
         "Unknown root",
-        MobilePayload.model(state.get().model)
+        MobilePayload.model(savedState.get().model)
             .getJSONObject("adjustments")
             .getJSONObject("mappings")
             .getString("Missing"));
@@ -1388,19 +1389,15 @@ public class SyncLifecycleTest {
     CountDownLatch invalid = new CountDownLatch(1);
     InstrumentationRegistry.getInstrumentation()
         .runOnMainSync(
-            () -> {
-              model.state().removeObserver(observer);
-              observer =
-                  value -> {
-                    state.set(value);
-                    if (value.message.startsWith("Could not save project adjustments"))
+            () ->
+                model.saveAdjustments(
+                    "{\"format\":\"todoist-assistant-project-adjustments-v1\",\"mappings\":{\"Old\":42},\"archivedParents\":[]}",
+                    error -> {
+                      saveError.set(error);
                       invalid.countDown();
-                  };
-              model.state().observeForever(observer);
-              model.saveAdjustments(
-                  "{\"format\":\"todoist-assistant-project-adjustments-v1\",\"mappings\":{\"Old\":42},\"archivedParents\":[]}");
-            });
+                    }));
     assertTrue(invalid.await(10, TimeUnit.SECONDS));
+    assertTrue(saveError.get().startsWith("Could not save project adjustments"));
     assertEquals(
         "Unknown root",
         new SnapshotStore(context)
@@ -1422,7 +1419,11 @@ public class SyncLifecycleTest {
               model.showDemo();
             });
     assertTrue(demo.await(10, TimeUnit.SECONDS));
-    InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> model.saveAdjustments("{}"));
+    InstrumentationRegistry.getInstrumentation()
+        .runOnMainSync(() -> model.saveAdjustments("{}", saveError::set));
+    assertEquals(
+        "Project adjustments are unavailable right now. Try again when the account is ready.",
+        saveError.get());
     assertTrue(state.get().demo);
     assertEquals(
         "Unknown root",

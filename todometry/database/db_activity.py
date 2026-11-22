@@ -1,11 +1,12 @@
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 
-from todometry.api import RequestSpec, TodoistAPIClient, TodoistEndpoints
-from todometry.api.client import EndpointCallResult
+from todometry.api import RequestSpec, TodoistEndpoints
+from todometry.api.client import TodoistConnection
 from todometry.core.types import Event, EventEntry
 from todometry.core.utils import (
     get_max_concurrent_requests,
@@ -14,6 +15,12 @@ from todometry.core.utils import (
 )
 
 ACTIVITY_PAGE_LIMIT = 100
+
+
+def _activity_query_date(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _format_progress_date_range(date_from: datetime, date_to: datetime) -> str:
@@ -27,43 +34,26 @@ def _events_not_in(events: list[Event], seen: set[Event] | None) -> list[Event]:
     return [event for event in events if event not in seen] if seen else events
 
 
-class DatabaseActivity:
+class DatabaseActivity(TodoistConnection):
     """Database class to fetch activity data from the Todoist API."""
-
-    def __init__(self):
-        # Participate in cooperative multiple inheritance so other mixins get initialized.
-        super().__init__()
-        self._api_client = TodoistAPIClient()
-
-    def reset(self):
-        pass
-
-    @property
-    def last_call_details(self) -> EndpointCallResult | None:
-        """Expose metadata about the most recent API call."""
-
-        return self._api_client.last_call_result
 
     def fetch_activity_adaptively(
         self,
         nweeks_window_size: int = 10,
         early_stop_after_n_windows: int = 5,
-        max_pages_per_window: int | None = None,
         events_already_fetched: set[Event] | None = None,
         progress_desc: str = "Querying activity data",
         date_to: datetime | None = None,
         max_workers: int | None = None,
-        on_events: Callable[[set[Event]], object] | None = None,
+        on_window: Callable[[datetime, datetime, set[Event]], None] | None = None,
     ) -> list[Event]:
         """
         Fetch activity events from Todoist API in a moving-window pattern.
 
-        Each iteration fetches a chunk of pages and keeps moving backward by
-        increasing the starting page offset. The loop stops after enough
-        consecutive empty windows to avoid unnecessary deep history scans.
+        Each window scans all cursor pages for a date range. The loop moves
+        backward until enough consecutive windows contain no unseen events.
         """
-        if events_already_fetched is None:
-            events_already_fetched = set()
+        events_already_fetched = set(events_already_fetched or ())
 
         n_empty_weeks: int = 0
         iterated_weeks: int = 0
@@ -85,10 +75,9 @@ class DatabaseActivity:
         total_events: list[Event] = []
         logger.debug(
             "Start fetch_activity_adaptively: window_size={}, early_stop={}, "
-            "max_pages_per_window={}, workers={}, date_to={}",
+            "workers={}, date_to={}",
             nweeks_window_size,
             early_stop_after_n_windows,
-            max_pages_per_window,
             worker_count,
             now_utc.isoformat(),
         )
@@ -122,10 +111,10 @@ class DatabaseActivity:
                         ),
                     )
                     future = executor.submit(
+                        copy_context().run,
                         self._fetch_activity_range,
                         date_from=window_start,
                         date_to=window_end,
-                        max_pages=max_pages_per_window,
                         events_already_fetched=set(events_already_fetched),
                         progress_desc=progress_desc,
                     )
@@ -133,7 +122,6 @@ class DatabaseActivity:
                     iterated_weeks += nweeks_window_size
 
                 for current_window, window_start, window_end, future in batch:
-                    window_events = future.result()
                     window_range = _format_progress_date_range(window_start, window_end)
                     if n_empty_weeks >= early_stop_after_n_windows:
                         logger.debug(
@@ -141,12 +129,13 @@ class DatabaseActivity:
                             current_window,
                         )
                         continue
+                    window_events = future.result()
                     new_events = _events_not_in(window_events, events_already_fetched)
                     n_empty_weeks = n_empty_weeks + 1 if not new_events else 0
                     total_events.extend(new_events)
                     events_already_fetched.update(new_events)
-                    if new_events and on_events is not None:
-                        on_events(set(new_events))
+                    if on_window is not None:
+                        on_window(window_start, window_end, set(new_events))
                     remaining_empty_windows = early_stop_after_n_windows - n_empty_weeks
                     report_tqdm_progress(
                         progress_desc,
@@ -176,137 +165,18 @@ class DatabaseActivity:
         total_events.sort(key=lambda x: x.event_entry.event_date, reverse=True)
         return total_events
 
-    def fetch_activity(self, max_pages: int = 4, starting_page: int = 0) -> list[Event]:
-        """
-        Fetch activity data from Todoist API.
-
-        - `starting_page` skips the first N cursor pages
-        - `max_pages` collects up to N cursor pages after that
-        """
-        if max_pages <= 0:
-            logger.warning("No pages requested (max_pages=0). Returning empty result.")
-            return []
-
-        if starting_page < 0:
-            logger.warning(
-                f"Negative starting_page={starting_page} provided; treating as 0."
-            )
-            starting_page = 0
-
-        result: list[Event] = []
-        cursor: str | None = None
-
-        logger.info(
-            f"Starting activity fetch over pages [{starting_page}, {starting_page + max_pages - 1}] "
-            f"(total={max_pages})"
-        )
-
-        # Skip preceding pages first so callers can still request a page window.
-        current_page_idx = 0
-        while current_page_idx < starting_page:
-            page_entries, next_cursor = self._fetch_activity_page(
-                page_index=current_page_idx,
-                cursor=cursor,
-            )
-            current_page_idx += 1
-            _ = page_entries
-            if not next_cursor:
-                logger.debug(
-                    f"No further activity cursor while skipping page {current_page_idx - 1}"
-                )
-                return []
-            cursor = next_cursor
-
-        # Collect the requested page window.
-        collected_pages = 0
-        while collected_pages < max_pages:
-            page_index = starting_page + collected_pages
-            report_tqdm_progress(
-                "Fetching recent activity",
-                collected_pages,
-                max_pages,
-                "page",
-            )
-            page_entries, next_cursor = self._fetch_activity_page(
-                page_index=page_index,
-                cursor=cursor,
-            )
-            result.extend(self._events_from_entries(page_entries))
-            collected_pages += 1
-            report_tqdm_progress(
-                "Fetching recent activity",
-                collected_pages,
-                max_pages,
-                "page",
-            )
-            if not next_cursor:
-                logger.debug(
-                    f"No further activity cursor available at page {page_index}"
-                )
-                break
-            cursor = next_cursor
-
-        logger.info(
-            f"Finished fetching activity pages. Total events collected: {len(result)}"
-        )
-        return result
-
-    def fetch_activity_recent(self, max_pages: int = 2) -> list[Event]:
-        """Fetch only the newest cursor pages used for routine polling."""
-
-        logger.info("Activity sync mode=recent; pages={}", max_pages)
-        return self.fetch_activity(max_pages=max_pages)
-
     def fetch_activity_incremental(
         self,
         events_already_fetched: set[Event],
         *,
-        overlap_days: int = 1,
-        date_to: datetime | None = None,
+        date_from: datetime | None,
+        date_to: datetime,
         progress_desc: str = "Fetching recent activity",
     ) -> list[Event]:
-        """Fetch activity since the newest cached event with a calendar-day overlap.
-
-        The overlap makes routine syncs resilient to delayed or reordered activity
-        records. The range is paginated without a page cap, so a busy account cannot
-        silently lose events between dashboard refreshes.
-        """
-        if overlap_days < 0:
-            raise ValueError("overlap_days must be non-negative")
-        if not events_already_fetched:
-            logger.info("Activity sync mode=recent; no cached boundary")
-            return self.fetch_activity_recent(max_pages=2)
-
-        def _event_date_utc(event: Event) -> datetime:
-            event_date = event.date
-            if event_date.tzinfo is None:
-                return event_date.replace(tzinfo=timezone.utc)
-            return event_date.astimezone(timezone.utc)
-
-        newest_event = max(events_already_fetched, key=_event_date_utc)
-        newest_date = newest_event.date
-        if newest_date.tzinfo is None:
-            newest_date = newest_date.replace(tzinfo=timezone.utc)
-        else:
-            newest_date = newest_date.astimezone(timezone.utc)
-
-        range_end = date_to or datetime.now(timezone.utc)
-        if range_end.tzinfo is None:
-            range_end = range_end.replace(tzinfo=timezone.utc)
-        else:
-            range_end = range_end.astimezone(timezone.utc)
-        range_start = newest_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        range_start -= timedelta(days=overlap_days)
-
-        logger.info(
-            "Activity sync mode=incremental; newest_cached_id={}; range=[{} .. {})",
-            newest_event.id,
-            range_start.isoformat(),
-            range_end.isoformat(),
-        )
+        """Read all cursor pages through the last verified activity boundary."""
         return self._fetch_activity_range(
-            date_from=range_start,
-            date_to=range_end,
+            date_from=date_from,
+            date_to=date_to,
             events_already_fetched=events_already_fetched,
             progress_desc=progress_desc,
         )
@@ -320,7 +190,7 @@ class DatabaseActivity:
         date_to: datetime | None = None,
         progress_desc: str = "Fetching activity history",
         max_workers: int | None = None,
-        on_events: Callable[[set[Event]], object] | None = None,
+        on_window: Callable[[datetime, datetime, set[Event]], None] | None = None,
     ) -> list[Event]:
         """Backfill older activity windows, optionally ending at the cache boundary."""
 
@@ -338,64 +208,49 @@ class DatabaseActivity:
             date_to=date_to,
             progress_desc=progress_desc,
             max_workers=max_workers,
-            on_events=on_events,
+            on_window=on_window,
         )
 
     def _fetch_activity_range(
         self,
         *,
-        date_from: datetime,
+        date_from: datetime | None,
         date_to: datetime,
-        max_pages: int | None = None,
         events_already_fetched: set[Event] | None = None,
         progress_desc: str = "Querying activity data",
         parent_project_id: str | None = None,
     ) -> list[Event]:
-        if max_pages is not None and max_pages <= 0:
-            return []
-
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         events: list[Event] = []
+        start_label = (
+            date_from.isoformat() if date_from is not None else "earliest available"
+        )
         logger.info(
-            f"Starting activity fetch over range [{date_from.isoformat()} .. {date_to.isoformat()})"
+            "Starting activity fetch over range [{} .. {})",
+            start_label,
+            date_to.isoformat(),
         )
         fetched_pages = 0
 
         while True:
-            if max_pages is not None and fetched_pages >= max_pages:
-                if cursor is not None:
-                    logger.warning(
-                        "Stopping activity range fetch after {} pages (bounded mode); "
-                        "results may be truncated for range [{} .. {}).",
-                        fetched_pages,
-                        date_from.isoformat(),
-                        date_to.isoformat(),
-                    )
-                else:
-                    logger.debug(
-                        "Stopping activity range fetch after {} pages (bounded mode)",
-                        fetched_pages,
-                    )
-                break
-
             params: dict[str, str | int] = {
                 "limit": ACTIVITY_PAGE_LIMIT,
-                "date_from": date_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "date_to": date_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "date_to": _activity_query_date(date_to),
             }
+            if date_from is not None:
+                params["date_from"] = _activity_query_date(date_from)
             if parent_project_id:
                 params["parent_project_id"] = parent_project_id
             if cursor:
                 params["cursor"] = cursor
 
             next_page_number = fetched_pages + 1
-            estimated_total_pages = (
-                max_pages if max_pages is not None else next_page_number + 1
-            )
+            estimated_total_pages = next_page_number + 1
             report_tqdm_progress(
                 progress_desc,
                 next_page_number,
-                max(estimated_total_pages, 1),
+                estimated_total_pages,
                 "page",
             )
             spec = RequestSpec(
@@ -409,17 +264,16 @@ class DatabaseActivity:
             page_entries, next_cursor = self._fetch_activity_entries_page(
                 spec,
                 operation_name=(
-                    f"fetch activity range {date_from.isoformat()} "
+                    f"fetch activity range {start_label} "
                     f"{date_to.isoformat()}{project_suffix}"
                 ),
-                context="activity range",
             )
             page_events = self._events_from_entries(page_entries)
             fetched_pages += 1
             report_tqdm_progress(
                 progress_desc,
                 fetched_pages,
-                max(estimated_total_pages, fetched_pages),
+                estimated_total_pages,
                 "page",
             )
             page_new_events = _events_not_in(page_events, events_already_fetched)
@@ -443,6 +297,9 @@ class DatabaseActivity:
                     "page",
                 )
                 break
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Todoist repeated an activity pagination cursor.")
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
         logger.info(
@@ -627,7 +484,9 @@ class DatabaseActivity:
             )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(_scan_project, project_index, parent_project_id)
+                executor.submit(
+                    copy_context().run, _scan_project, project_index, parent_project_id
+                )
                 for project_index, parent_project_id in enumerate(project_ids, start=1)
             ]
             for completed_projects, future in enumerate(as_completed(futures), start=1):
@@ -665,58 +524,43 @@ class DatabaseActivity:
                     .astimezone(timezone.utc)
                     .replace(tzinfo=None)
                 )
-            except (TypeError, ValueError):
-                event_date = None
-            if event_date is None:
-                logger.debug(
-                    f"Skipping event {entry.id} due to unparseable date {entry.event_date}"
-                )
-                continue
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Todoist returned an invalid activity timestamp."
+                ) from exc
+            if not isinstance(entry.id, (int, str)) or entry.id == "":
+                raise RuntimeError("Todoist returned activity without an event ID.")
+            entry.id = str(entry.id)
             events.append(Event(event_entry=entry, id=entry.id, date=event_date))
         return events
-
-    def _fetch_activity_page(
-        self,
-        *,
-        page_index: int,
-        cursor: str | None,
-    ) -> tuple[list[EventEntry], str | None]:
-        params: dict[str, str | int] = {"limit": ACTIVITY_PAGE_LIMIT}
-        if cursor:
-            params["cursor"] = cursor
-
-        spec = RequestSpec(
-            endpoint=TodoistEndpoints.LIST_ACTIVITY,
-            params=params,
-            rate_limited=True,
-        )
-        return self._fetch_activity_entries_page(
-            spec,
-            operation_name=f"fetch activity page {page_index}",
-            context="activity page",
-        )
 
     def _fetch_activity_entries_page(
         self,
         spec: RequestSpec,
         *,
         operation_name: str,
-        context: str,
     ) -> tuple[list[EventEntry], str | None]:
         decoded_result = self._api_client.request_json(
             spec, operation_name=operation_name
         )
         if not isinstance(decoded_result, dict):
-            raise RuntimeError(f"Unexpected response payload when fetching {context}")
+            raise RuntimeError("Unexpected response payload when fetching activity range")
 
         raw_events = decoded_result.get("results")
         if not isinstance(raw_events, list):
-            raise RuntimeError(f"Unexpected results payload when fetching {context}")
+            raise RuntimeError("Unexpected results payload when fetching activity range")
         if not all(isinstance(event, dict) for event in raw_events):
             raise RuntimeError(
-                f"Unexpected non-object event record in {context} payload"
+                "Unexpected non-object event record in activity range payload"
             )
 
         events = [safe_instantiate_entry(EventEntry, **event) for event in raw_events]
         next_cursor = decoded_result.get("next_cursor")
-        return events, str(next_cursor) if isinstance(next_cursor, str) else None
+        if "next_cursor" not in decoded_result or (
+            next_cursor is not None
+            and (not isinstance(next_cursor, str) or not next_cursor)
+        ):
+            raise RuntimeError(
+                "Todoist returned an invalid activity pagination cursor."
+            )
+        return events, next_cursor

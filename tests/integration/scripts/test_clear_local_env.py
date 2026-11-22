@@ -4,11 +4,11 @@ from pathlib import Path
 
 from scripts.clear_local_env import clear_local_env, main
 from todometry.core.env import EnvVar
-from todometry.core.utils import RUNTIME_MIGRATABLE_FILENAMES
+from todometry.core.utils import RUNTIME_CACHE_FILENAMES
 
 
 def _write_runtime_files(root: Path) -> None:
-    for filename in RUNTIME_MIGRATABLE_FILENAMES:
+    for filename in RUNTIME_CACHE_FILENAMES:
         path = root / filename
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("payload", encoding="utf-8")
@@ -37,7 +37,7 @@ def test_clear_local_env_removes_source_of_truth_runtime_files(tmp_path, monkeyp
 
     clear_local_env()
 
-    for filename in RUNTIME_MIGRATABLE_FILENAMES:
+    for filename in RUNTIME_CACHE_FILENAMES:
         assert not (tmp_path / filename).exists()
         assert not (data_dir / filename).exists()
     assert not cache_dir.exists()

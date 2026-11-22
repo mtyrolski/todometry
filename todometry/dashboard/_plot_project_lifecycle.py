@@ -6,8 +6,8 @@ from typing import Literal, NotRequired, TypedDict, cast
 import pandas as pd
 
 from todometry.core.completions import effective_completion_mask
-
 from todometry.core.types import Project
+from todometry.database.dataframe import ProjectHierarchy, resolve_project_hierarchy
 
 
 class ProjectLifecycleChild(TypedDict):
@@ -75,13 +75,13 @@ _ARCHIVED_ROOTS_ID = "archived-root-projects"
 _ARCHIVED_ROOTS_NAME = "Archived root projects"
 
 
-
-
 def build_project_lifecycle_data(
     activity: pd.DataFrame,
     beg: datetime,
     end: datetime,
     projects: list[Project],
+    *,
+    hierarchy: ProjectHierarchy | None = None,
 ) -> ProjectLifecycleData:
     """Return semantic lifecycle rows for the native project-timeline UI."""
 
@@ -93,7 +93,7 @@ def build_project_lifecycle_data(
             "history": _history_payload(activity, projects, []),
         }
 
-    spans = _lifecycle_spans(activity, projects, window_start, window_end)
+    spans = _lifecycle_spans(activity, projects, window_start, window_end, hierarchy)
     grouped: defaultdict[str, list[_Span]] = defaultdict(list)
     for span in spans:
         grouped[span.parent_id].append(span)
@@ -146,6 +146,7 @@ def _lifecycle_spans(
     projects: list[Project],
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
+    hierarchy: ProjectHierarchy | None,
 ) -> list[_Span]:
     frame = activity.copy()
     frame.index = pd.to_datetime(frame.index, errors="coerce", utc=True).tz_localize(
@@ -153,9 +154,7 @@ def _lifecycle_spans(
     )
     frame = frame.loc[~frame.index.isna()]
     event_column = "event_type" if "event_type" in frame else "type"
-    return _spans(frame, event_column, projects, window_start, window_end)
-
-
+    return _spans(frame, event_column, projects, window_start, window_end, hierarchy)
 
 
 def _spans(
@@ -164,13 +163,10 @@ def _spans(
     projects: list[Project],
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
+    hierarchy: ProjectHierarchy | None,
 ) -> list[_Span]:
     by_id = {str(project.id): project for project in projects}
-    active_roots = {
-        str(project.id): project
-        for project in projects
-        if not project.is_archived and not _parent_id(project)
-    }
+    hierarchy = hierarchy or resolve_project_hierarchy(by_id)
     activity_by_project: dict[str, pd.DataFrame] = {}
     if "parent_project_id" in frame:
         for project_id, group in frame.groupby(
@@ -182,13 +178,23 @@ def _spans(
         project_frame = activity_by_project.get(str(project.id))
         if project_frame is None:
             project_frame = frame.head(0)
-        root_id = _activity_root_id(project_frame, by_id) or _root_id(project, by_id)
         project_id = str(project.id)
-        if root_id in active_roots and project_id == root_id:
-            continue
-        if root_id in by_id and root_id != project_id:
+        root_id = hierarchy.groups[project_id].root_id
+        if (
+            project.is_archived
+            and hierarchy.original_parents[project_id] is None
+            and project_id not in hierarchy.adjusted_projects
+        ):
+            recovered_root = _activity_root_id(project_frame, by_id)
+            if recovered_root is not None:
+                root_id = hierarchy.groups[recovered_root].root_id
+
+        if root_id in by_id and (
+            root_id != project_id
+            or (project.is_archived and project_id in hierarchy.explicit_roots)
+        ):
             parent_id = root_id
-            parent_name = by_id[root_id].project_entry.name
+            parent_name = hierarchy.labels[root_id]
         elif project.is_archived:
             parent_id = _ARCHIVED_ROOTS_ID
             parent_name = _ARCHIVED_ROOTS_NAME
@@ -363,25 +369,6 @@ def _span_payload(span: _Span) -> ProjectLifecycleChild:
     }
 
 
-
-
-def _parent_id(project: Project) -> str | None:
-    value = project.project_entry.parent_id or project.project_entry.v2_parent_id
-    return str(value) if value else None
-
-
-def _root_id(project: Project, by_id: dict[str, Project]) -> str:
-    current = str(project.id)
-    visited: set[str] = set()
-    while current in by_id and current not in visited:
-        visited.add(current)
-        parent = _parent_id(by_id[current])
-        if not parent:
-            return current
-        current = parent
-    return current
-
-
 def _timestamp(value: str | datetime | pd.Timestamp | None) -> pd.Timestamp | None:
     if value is None:
         return None
@@ -392,9 +379,3 @@ def _timestamp(value: str | datetime | pd.Timestamp | None) -> pd.Timestamp | No
     if not isinstance(parsed, pd.Timestamp):
         return None
     return parsed.tz_convert(None) if parsed.tzinfo else parsed
-
-
-
-
-
-

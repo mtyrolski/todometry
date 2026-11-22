@@ -359,6 +359,7 @@ def test_completed_tasks_periodically_uses_matching_forecast_marker_colors(
 def test_plot_completed_tasks_periodically_does_not_forecast_stale_history(
     monkeypatch: Any,
 ):
+    monkeypatch.setenv("TODOIST_TIMEZONE", "UTC")
     _freeze_periodic_now(monkeypatch, datetime(2026, 5, 13, 12, 0, 0))
     df = _archived_visibility_df()
 
@@ -368,10 +369,14 @@ def test_plot_completed_tasks_periodically_does_not_forecast_stale_history(
         datetime(2026, 5, 13),
         granularity="W-SUN",
         project_colors={"Deepflare": "#ff8800", "OldOnly": "#111111"},
+        visibility_beg_date=datetime(2026, 3, 1),
+        visibility_end_date=datetime(2026, 5, 13),
+        bounds_are_utc=True,
     )
 
     trace_names = [name.lower() for name in _trace_names(fig)]
     assert not any("forecast" in name or "so far" in name for name in trace_names)
+    assert fig.layout.xaxis.range == (datetime(2026, 3, 1), datetime(2026, 5, 18))
 
 
 @pytest.mark.parametrize(

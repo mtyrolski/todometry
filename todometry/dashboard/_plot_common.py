@@ -30,6 +30,36 @@ def apply_dashboard_axes(fig: go.Figure) -> go.Figure:
     return fig
 
 
+def apply_date_axis_viewport(
+    fig: go.Figure,
+    *,
+    beg: datetime,
+    end: datetime,
+    rangeslider: bool = True,
+) -> go.Figure:
+    """Keep the plotted history available while opening on the selected viewport."""
+
+    slider = (
+        {
+            "visible": True,
+            "thickness": 0.08,
+            "bgcolor": "rgba(255,255,255,0.05)",
+            "bordercolor": "rgba(255,255,255,0.14)",
+            "borderwidth": 1,
+        }
+        if rangeslider
+        else {"visible": False}
+    )
+    fig.update_xaxes(
+        range=[beg, end],
+        rangeslider=slider,
+        type="date",
+        fixedrange=False,
+    )
+    fig.update_layout(uirevision=f"{beg.isoformat()}:{end.isoformat()}")
+    return fig
+
+
 def period_grouper(freq: str) -> Any:
     # Pandas supports `label` and `closed`, but type stubs frequently lag behind.
     return pd.Grouper(freq=freq, label="right", closed="right")  # type: ignore[call-arg]

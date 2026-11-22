@@ -4,8 +4,8 @@ from tqdm import tqdm
 from todometry.core.utils import TODOIST_COLOR_NAME_TO_RGB
 from loguru import logger
 
-from todometry.api import RequestSpec, TodoistAPIClient, TodoistEndpoints
-from todometry.api.client import EndpointCallResult
+from todometry.api import RequestSpec, TodoistEndpoints
+from todometry.api.client import TodoistConnection
 
 
 class LabelRecord(TypedDict):
@@ -14,22 +14,12 @@ class LabelRecord(TypedDict):
     id: NotRequired[str]
 
 
-class DatabaseLabels:
-    def __init__(self):
-        super().__init__()
-        self._api_client = TodoistAPIClient()
+class DatabaseLabels(TodoistConnection):
+    def __init__(self, *, api_key: str | None = None):
+        super().__init__(api_key=api_key)
         self._labels: list[LabelRecord] = []
         self._mapping_label_name_to_color: dict[str, str] = {}
         self._fetch_label_data()
-
-    def reset(self):
-        self._fetch_label_data()
-
-    @property
-    def last_call_details(self) -> EndpointCallResult | None:
-        """Expose metadata about the most recent API call."""
-
-        return self._api_client.last_call_result
 
     def fetch_label_colors(self) -> dict[str, str]:
         """

@@ -17,7 +17,7 @@ from joblib import dump, load
 
 from todometry.core.env import EnvVar
 from todometry.database.dataframe import load_activity_data
-from todometry.web.api import _DASHBOARD_STATE_SCHEMA_VERSION
+from todometry.web.api_components.dashboard_runtime import _DASHBOARD_STATE_SCHEMA_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]

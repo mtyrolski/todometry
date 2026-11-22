@@ -5,8 +5,8 @@ from functools import partial
 from loguru import logger
 from tqdm import tqdm
 
-from todometry.api import RequestSpec, TodoistAPIClient, TodoistEndpoints
-from todometry.api.client import EndpointCallResult
+from todometry.api import RequestSpec, TodoistEndpoints
+from todometry.api.client import TodoistConnection
 from todometry.core.types import Project, ProjectEntry, Task, TaskEntry
 from todometry.core.utils import (
     RETRY_MAX_ATTEMPTS,
@@ -56,10 +56,9 @@ def preserve_archived_parent_links(
             entry.parent_id = parent
 
 
-class DatabaseProjects:
-    def __init__(self):
-        super().__init__()
-        self._api_client = TodoistAPIClient()
+class DatabaseProjects(TodoistConnection):
+    def __init__(self, *, api_key: str | None = None):
+        super().__init__(api_key=api_key)
         self.archived_projects_cache: dict[str, Project] | None = (
             None  # Not initialized yet
         )
@@ -70,22 +69,6 @@ class DatabaseProjects:
         self.mapping_project_name_to_color: dict[str, str] | None = (
             None  # Not initialized yet
         )
-
-    def pull(self):
-        self.fetch_archived_projects()
-        self.fetch_projects(include_tasks=True)
-
-    def reset(self):
-        self.archived_projects_cache = None
-        self.projects_cache = None
-        self.mapping_project_id_to_root_cache = None
-        self.pull()
-
-    @property
-    def last_call_details(self) -> EndpointCallResult | None:
-        """Expose metadata about the most recent API call."""
-
-        return self._api_client.last_call_result
 
     def fetch_archived_projects(self) -> list[Project]:
         if self.archived_projects_cache is not None:
@@ -381,13 +364,7 @@ class DatabaseProjects:
             lambda project: project.project_entry.name,
         )
 
-    def fetch_mapping_project_name_to_id(self) -> dict[str, str]:
-        return self._project_mapping(
-            lambda project: project.project_entry.name,
-            lambda project: project.id,
-        )
-
-    def fetch_mapping_project_id_to_root(self) -> dict[str, "Project"]:
+    def fetch_mapping_project_id_to_root(self) -> dict[str, Project]:
         if self.mapping_project_id_to_root_cache is not None:
             return self.mapping_project_id_to_root_cache
 
@@ -404,8 +381,8 @@ class DatabaseProjects:
 
         logger.info("Building project hierarchy (active + archived) in memory")
         if not all_projects:
-            self.mapping_project_id_to_root_cache = {}
-            return self.mapping_project_id_to_root_cache
+            self.mapping_project_id_to_root_cache = mapping_project_id_to_root
+            return mapping_project_id_to_root
 
         # Project id -> root project id memoization to avoid repeated parent-chain traversals.
         root_id_cache: dict[str, str | None] = {}
@@ -446,7 +423,7 @@ class DatabaseProjects:
             )
 
         self.mapping_project_id_to_root_cache = mapping_project_id_to_root
-        return self.mapping_project_id_to_root_cache
+        return mapping_project_id_to_root
 
     def fetch_mapping_project_id_to_color(self) -> dict[str, str]:
         """
@@ -476,18 +453,6 @@ class DatabaseProjects:
         }
         self.mapping_project_name_to_color = name_to_color
         return name_to_color
-
-    def _get_root_project(self, project_id: str) -> Project | None:
-        """Resolve the root ancestor project following parent chain."""
-        project = try_n_times(partial(self.fetch_project_by_id, project_id), 3)
-        if project is None:
-            logger.error(f"Could not fetch project {project_id} after retries")
-            return None
-        parent_id = project.project_entry.parent_id or project.project_entry.v2_parent_id
-        if parent_id is None:
-            return project
-        # Recurse up
-        return self._get_root_project(parent_id)
 
     def _resolve_root_project_id_in_memory(
         self,

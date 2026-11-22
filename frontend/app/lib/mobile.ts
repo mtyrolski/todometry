@@ -7,7 +7,7 @@ export function normalizeSearch(value: string): string {
   return value.toLocaleLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/ł/g, "l").trim();
 }
 
-export type MobileTask = {
+type MobileTask = {
   id: string;
   projectId: string;
   parentId?: string;

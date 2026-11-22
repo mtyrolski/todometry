@@ -9,9 +9,9 @@ export default function ProjectAdjustmentsPage() {
       <PageHeader
         eyebrow="Operations"
         title="Project Adjustments"
-        lede="Map archived projects into your current project hierarchy."
+        lede="Choose main projects and group active or archived projects under them."
       />
-      <ProjectAdjustmentsBoard showWhenEmpty />
+      <ProjectAdjustmentsBoard />
     </>
   );
 }

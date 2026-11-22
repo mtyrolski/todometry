@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -15,6 +15,7 @@ from todometry.core.env import EnvVar
 from todometry.dashboard._plot_common import (
     _ALL_TASKS_TOTAL_COLOR,
     apply_dashboard_axes,
+    apply_date_axis_viewport,
     forecast_period_total,
     period_grouper,
 )
@@ -812,6 +813,14 @@ def _completed_tasks_periodically_figure(
         ),
         margin=dict(l=56, r=86, t=84, b=60),
     )
+    if visibility_beg_date is not None and visibility_end_date is not None:
+        viewport_end = visibility_end_date
+        if bounds_are_utc and forecast_context.current_end is not None:
+            # Rolling charts show the whole final day of the period.
+            viewport_end = max(
+                viewport_end, forecast_context.current_end + timedelta(microseconds=1)
+            )
+        apply_date_axis_viewport(fig, beg=visibility_beg_date, end=viewport_end)
     return apply_dashboard_axes(fig)
 
 

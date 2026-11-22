@@ -1,113 +1,131 @@
 """Resolve saved and inferred project adjustment mappings."""
 
-from typing import Any, cast
+import os
+from collections import Counter
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from loguru import logger
+
+from todometry.core.types import Project
+from todometry.database.base import Database
+from todometry.database.dataframe import (
+    DEFAULT_ADJUSTMENTS_FILENAME,
+    ProjectAdjustments,
+    ProjectHierarchy,
+    load_adjustments_file,
+    normalize_adjustment_filename,
+    render_adjustments_file_content,
+    resolve_personal_dir,
+)
+from todometry.web.api_components.runtime import resolve_env_path
 
 
-def _preferred_adjustment_project_id(
-    project_name: str, project_records: list[dict[str, Any]]
-) -> str | None:
-    matches = [
-        record for record in project_records if record.get("name") == project_name
-    ]
-    active_matches = [record for record in matches if not record.get("isArchived")]
-    preferred = active_matches or matches
-    if len(preferred) != 1:
-        return None
-    return str(preferred[0]["id"])
+_REMAPPABLE_ACTIVE_ROOT_PROJECTS = frozenset({"Inbox"})
 
 
-def _resolve_automatic_project_mappings(
-    project_records: list[dict[str, Any]],
-    *,
-    manual_mappings: dict[str, str],
-    archived_parent_projects: set[str],
-) -> tuple[dict[str, str], list[dict[str, str | None]]]:
-    """Infer archived-project root assignments not overridden by saved mappings."""
+def _project_choices(projects: list[Project]) -> tuple[set[str], set[str]]:
+    active_roots: set[str] = set()
+    archived_names: set[str] = set()
+    for project in projects:
+        entry = project.project_entry
+        if project.is_archived:
+            archived_names.add(entry.name)
+        elif not (entry.parent_id or entry.v2_parent_id):
+            active_roots.add(entry.name)
+    return active_roots, archived_names
 
-    candidates: dict[str, set[str]] = {}
-    candidate_details: list[dict[str, str | None]] = []
-    for record in project_records:
-        if not record.get("isArchived"):
-            continue
-        source_name = str(record.get("name") or "")
+
+def _automatic_mappings(
+    projects: dict[str, Project],
+    rules: ProjectAdjustments,
+    hierarchy: ProjectHierarchy,
+) -> dict[str, str]:
+    """Project resolved assignments into name rules for the board and Android export."""
+    automatic: dict[str, str] = {}
+    name_counts = Counter(project.project_entry.name for project in projects.values())
+    explicit_names = set(rules.mappings) | set(rules.archived_parents)
+    for source_id, project in projects.items():
+        source_name = project.project_entry.name
         if (
-            not source_name
-            or source_name in manual_mappings
-            or source_name in archived_parent_projects
+            not project.is_archived
+            or name_counts[source_name] != 1
+            or source_name in explicit_names
+            or source_id in rules.project_mappings
         ):
             continue
-        ancestors = cast(list[dict[str, str]], record.get("ancestors") or [])
-        if not ancestors:
+        group = hierarchy.groups[source_id]
+        target_id = group.root_id if group.alias is None else None
+        target_name = (
+            projects[group.root_id].project_entry.name
+            if group.alias is None
+            else group.alias
+        )
+        if target_name == source_name or (
+            target_id is not None
+            and hierarchy.legacy_target_ids.get(target_name) != target_id
+        ):
             continue
+        automatic[source_name] = target_name
+    return dict(sorted(automatic.items()))
 
-        promoted_parent = next(
-            (
-                ancestor
-                for ancestor in ancestors
-                if ancestor["name"] in archived_parent_projects
-            ),
-            None,
-        )
-        manual_ancestor = next(
-            (ancestor for ancestor in ancestors if ancestor["name"] in manual_mappings),
-            None,
-        )
-        if promoted_parent is not None:
-            target_name = promoted_parent["name"]
-            target_id = promoted_parent["id"]
-        elif manual_ancestor is not None:
-            target_name = manual_mappings[manual_ancestor["name"]]
-            target_id = _preferred_adjustment_project_id(target_name, project_records)
-        else:
-            target_name = str(record.get("rootName") or "")
-            target_id = str(record.get("rootId") or "") or None
-        if not target_name or target_name == source_name:
+
+def _available_mapping_files() -> list[str]:
+    personal_dir = resolve_personal_dir()
+    if not personal_dir.exists():
+        return [DEFAULT_ADJUSTMENTS_FILENAME]
+
+    mapping_files: list[str] = []
+    for file in sorted(personal_dir.iterdir()):
+        if not file.is_file() or file.name.startswith("__") or file.suffix != ".py":
             continue
+        try:
+            normalized = normalize_adjustment_filename(file.name)
+            load_adjustments_file(file)
+        except (TypeError, ValueError) as exc:
+            logger.warning("Skipping invalid project adjustment file {}: {}", file, exc)
+            continue
+        mapping_files.append(normalized)
 
-        candidates.setdefault(source_name, set()).add(target_name)
-        candidate_details.append(
-            {
-                "sourceProject": source_name,
-                "sourceProjectId": str(record.get("id") or "") or None,
-                "parentProject": target_name,
-                "parentProjectId": target_id,
-                "provenance": "automatic",
-            }
-        )
-
-    automatic_mappings = {
-        source_name: next(iter(target_names))
-        for source_name, target_names in sorted(candidates.items())
-        if len(target_names) == 1
-    }
-    details = [
-        detail
-        for detail in candidate_details
-        if automatic_mappings.get(str(detail["sourceProject"]))
-        == detail["parentProject"]
-    ]
-    return automatic_mappings, details
+    return sorted(mapping_files) if mapping_files else [DEFAULT_ADJUSTMENTS_FILENAME]
 
 
-def _manual_project_mapping_details(
-    project_records: list[dict[str, Any]], manual_mappings: dict[str, str]
-) -> list[dict[str, str | None]]:
-    details: list[dict[str, str | None]] = []
-    for source_name, target_name in sorted(manual_mappings.items()):
-        source_records = [
-            record for record in project_records if record.get("name") == source_name
-        ] or [{}]
-        target_id = _preferred_adjustment_project_id(target_name, project_records)
-        for record in source_records:
-            details.append(
-                {
-                    "sourceProject": source_name,
-                    "sourceProjectId": str(record.get("id") or "") or None,
-                    "parentProject": target_name,
-                    "parentProjectId": target_id,
-                    "provenance": "manual",
-                }
-            )
-    return details
+def _load_mapping_file(filename: str) -> ProjectAdjustments:
+    safe_filename = normalize_adjustment_filename(filename)
+    target = resolve_personal_dir() / safe_filename
+    return (
+        load_adjustments_file(target)
+        if target.exists()
+        else ProjectAdjustments({}, [], {})
+    )
 
 
+def _save_mapping_file(filename: str, rules: ProjectAdjustments) -> None:
+    safe_filename = normalize_adjustment_filename(filename)
+    personal_dir = resolve_personal_dir()
+    personal_dir.mkdir(parents=True, exist_ok=True)
+    target = personal_dir / safe_filename
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=personal_dir, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(render_adjustments_file_content(*rules))
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _load_projects_for_adjustments_sync(
+    cached_database: Database | None, refresh: bool
+) -> list[Project]:
+    dbio = (
+        cached_database
+        if not refresh and cached_database is not None
+        else Database(str(resolve_env_path()))
+    )
+    return dbio.fetch_projects(include_tasks=False) + dbio.fetch_archived_projects()

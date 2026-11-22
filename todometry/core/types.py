@@ -236,12 +236,12 @@ def is_event_rescheduled(event: "Event") -> bool:
     'extra_data_id': xxxxxx,
 
     """
-    return all(
-        [
-            event.event_entry.event_type == EventType.UPDATED.value,
-            EventExtraField.DUE_DATE in event.event_entry.extra_data,
-            EventExtraField.LAST_DUE_DATE in event.event_entry.extra_data,
-        ]
+    entry = event.event_entry
+    extra_data = entry.extra_data or {}
+    return (
+        entry.event_type == EventType.UPDATED.value
+        and EventExtraField.DUE_DATE in extra_data
+        and EventExtraField.LAST_DUE_DATE in extra_data
     )
 
 
@@ -260,18 +260,19 @@ class Event:
         return f"Event {self.id} ({self.date}) {self.name}"
 
     def __eq__(self, other):
-        return self.id == other.id
+        if not isinstance(other, Event):
+            return NotImplemented
+        return str(self.id) == str(other.id)
 
     def __hash__(self):
-        return hash(self.id)
+        return hash(str(self.id))
 
     @property
     def name(self) -> str | None:
-        if EventExtraField.CONTENT in self.event_entry.extra_data:
-            return self.event_entry.extra_data[EventExtraField.CONTENT]
-        if EventExtraField.NAME in self.event_entry.extra_data:
-            return self.event_entry.extra_data[EventExtraField.NAME]
-        return None
+        extra_data = self.event_entry.extra_data or {}
+        return extra_data.get(
+            EventExtraField.CONTENT, extra_data.get(EventExtraField.NAME)
+        )
 
     @property
     def event_type(self) -> str:
@@ -368,12 +369,13 @@ def events_to_dataframe(
 
         mapping_data["root_project_id"].append(root_project_id)
         mapping_data["root_project_name"].append(root_project_name)
-        mapping_data["id"].append(event.id)
+        event_id = str(event.id)
+        mapping_data["id"].append(event_id)
         mapping_data["title"].append(event.name)
         mapping_data["date"].append(event.date)
         mapping_data["type"].append(event.event_type)
         mapping_data["completion_effective"].append(
-            event.event_type == "completed" and event.id not in cancelled_completions
+            event.event_type == "completed" and event_id not in cancelled_completions
         )
         mapping_data["parent_project_id"].append(parent_project_id)
         mapping_data["parent_project_name"].append(

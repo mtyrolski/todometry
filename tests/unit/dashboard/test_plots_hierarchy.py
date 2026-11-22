@@ -1,7 +1,7 @@
 """Tests for the active project hierarchy sunburst plot."""
 
-from datetime import datetime
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, cast
 
 import pandas as pd
@@ -12,6 +12,7 @@ from tests.factories import make_project, make_project_entry
 from todometry.dashboard._plot_project_hierarchy import (
     plot_active_project_hierarchy_sunburst,
 )
+from todometry.database.dataframe import ProjectAdjustments, resolve_project_hierarchy
 
 ProjectSpec = tuple[str, str, str | None]
 TaskSpec = tuple[str, str, int, str, str]
@@ -294,7 +295,10 @@ def test_plot_project_hierarchy_sunburst_manual_mapping_overrides_archived_root(
         datetime(2025, 1, 31),
         [root, archived_root],
         {"Root A": "#123456"},
-        project_mappings={"Old Root": "Root A"},
+        hierarchy=resolve_project_hierarchy(
+            {"root-a": root, "old-root": archived_root},
+            ProjectAdjustments({"Old Root": "Root A"}, [], {}),
+        ),
     )
 
     nodes = _sunburst_node_map(fig)

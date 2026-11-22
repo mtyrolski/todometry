@@ -20,6 +20,7 @@ import androidx.core.view.WindowInsetsCompat;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.webkit.WebViewAssetLoader;
 import java.io.ByteArrayInputStream;
+import java.lang.ref.WeakReference;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.TreeSet;
@@ -290,6 +291,37 @@ public class MainActivity extends ComponentActivity {
     return "window.dispatchEvent(new CustomEvent('todoist-state',{detail:" + detail + "}))";
   }
 
+  private static String adjustmentRequestId(String argument) {
+    if (argument == null) return "";
+    try {
+      return new JSONObject(argument).optString("requestId");
+    } catch (org.json.JSONException invalid) {
+      return "";
+    }
+  }
+
+  private void saveAdjustments(String argument, String requestId) {
+    var activityRef = new WeakReference<>(this);
+    model.saveAdjustments(
+        argument,
+        error -> {
+          MainActivity activity = activityRef.get();
+          if (requestId.isEmpty()
+              || activity == null
+              || !activity.ready
+              || activity.isFinishing()
+              || activity.isDestroyed()) return;
+          activity.web.evaluateJavascript(
+              "window.dispatchEvent(new CustomEvent('todoist-adjustments-result',"
+                  + "{detail:{requestId:"
+                  + JSONObject.quote(requestId)
+                  + ",error:"
+                  + (error == null ? "null" : JSONObject.quote(error))
+                  + "}}))",
+              null);
+        });
+  }
+
   static JSONObject readSettings(android.content.SharedPreferences prefs)
       throws org.json.JSONException {
     var values = prefs.getAll();
@@ -353,6 +385,7 @@ public class MainActivity extends ComponentActivity {
 
     @JavascriptInterface
     public void command(String name, String argument) {
+      String requestId = "save-adjustments".equals(name) ? adjustmentRequestId(argument) : "";
       runOnUiThread(
           () -> {
             switch (name) {
@@ -380,7 +413,7 @@ public class MainActivity extends ComponentActivity {
                     new String[] {"application/json", "text/plain", "application/octet-stream"});
                 break;
               case "save-adjustments":
-                model.saveAdjustments(argument);
+                saveAdjustments(argument, requestId);
                 break;
               case "close":
                 finish();

@@ -49,7 +49,6 @@ export default function ControlPanelPage() {
           />
           <ServiceMonitor
             services={status?.services ?? null}
-            configurableItems={status?.configurableItems}
             onRefresh={refreshStatus}
           />
         </div>

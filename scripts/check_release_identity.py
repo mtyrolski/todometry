@@ -1,6 +1,5 @@
 """Block publication while release identity or known web debt remains unfinished."""
 
-import ast
 import re
 import tomllib
 from pathlib import Path
@@ -32,7 +31,7 @@ def identity_errors(root: Path) -> list[str]:
         matches = re.findall(r'^\s*sha256\s+"([0-9a-f]{64})"', definition, re.MULTILINE)
         if len(matches) != 1 or matches[0] == NOT_FOUND_SHA256:
             errors.append("Homebrew release archive needs its verified SHA-256")
-    errors.extend(check_tree(root, strict=True))
+    errors.extend(check_tree(root))
     for namespace in ("todoist", "todometry"):
         web = root / namespace / "web"
         for path in sorted(web.rglob("*.py")):
@@ -52,13 +51,6 @@ def identity_errors(root: Path) -> list[str]:
                         f"undefined-name suppression remains in {path.relative_to(root)}"
                     )
                     break
-        stub = web / "api.pyi"
-        if stub.is_file() and any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "__getattr__"
-            for node in ast.walk(ast.parse(stub.read_text(encoding="utf-8")))
-        ):
-            errors.append(f"catch-all API stub remains in {stub.relative_to(root)}")
     return errors
 
 

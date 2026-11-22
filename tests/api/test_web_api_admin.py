@@ -1,11 +1,22 @@
 """Tests for FastAPI admin endpoints."""
 
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+
+import pandas as pd
 import pytest
+from fastapi.testclient import TestClient
 
 import todometry.database.dataframe as dataframe_module
+from tests.web_api_helpers import _single_event_df
+from todometry.core.env import EnvVar
 from todometry.core.utils import MaxRetriesExceeded
-import todometry.web.api as web_api
-from todometry.web.services.project_adjustments import _resolve_automatic_project_mappings
+from todometry.web.api import create_app
+from todometry.web.api_components import dashboard_runtime
+from todometry.web.api_components.dashboard_runtime import DashboardSnapshot
+from todometry.web.dashboard_payload import DEFAULT_URGENCY_SETTINGS
+from todometry.web.routes import admin_settings
 
 # pylint: disable=protected-access
 
@@ -14,136 +25,31 @@ def _write_yaml(path, *lines: str) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def test_admin_project_adjustments_exposes_remappable_active_roots(
-    monkeypatch, api_client
+def test_admin_project_adjustments_returns_manual_and_automatic_groups(
+    monkeypatch, tmp_path, api_client, project_factory
 ) -> None:
-    monkeypatch.setattr(web_api, "_available_mapping_files", lambda: ["adj_private.py"])
-    monkeypatch.setattr(
-        web_api,
-        "_load_mapping_file",
-        lambda filename: ({"Archived Research": "Academy"}, []),
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path))
+    (tmp_path / "map.py").write_text(
+        dataframe_module.render_adjustments_file_content({"Old Root": "Academy"}),
+        encoding="utf-8",
     )
-
-    def _fake_projects_for_adjustments(refresh: bool):
-        _ = refresh
-        return (
-            ["Academy", "Inbox", "skynet"],
-            ["Archived Root"],
-            ["Archived Research", "Archived Root"],
-            ["Inbox"],
-        )
-
-    monkeypatch.setattr(
-        web_api, "_load_projects_for_adjustments_sync", _fake_projects_for_adjustments
-    )
-
-    res = api_client.get("/api/admin/project_adjustments")
-    assert res.status_code == 200
-    payload = res.json()
-
-    assert payload["remappableActiveRootProjects"] == ["Inbox"]
-    assert payload["sourceProjects"] == [
-        "Archived Research",
-        "Archived Root",
-        "Inbox",
-    ]
-    assert payload["unmappedSourceProjects"] == ["Archived Root", "Inbox"]
-
-
-def test_automatic_project_mappings_use_parent_ids_and_manual_overrides() -> None:
-    records = [
-        {
-            "id": "active-root",
-            "name": "Academy",
-            "isArchived": False,
-            "ancestors": [{"id": "active-root", "name": "Academy"}],
-            "rootId": "active-root",
-            "rootName": "Academy",
-        },
-        {
-            "id": "old-root",
-            "name": "Old Research",
-            "isArchived": True,
-            "ancestors": [{"id": "old-root", "name": "Old Research"}],
-            "rootId": "old-root",
-            "rootName": "Old Research",
-        },
-        {
-            "id": "old-child",
-            "name": "Old Experiment",
-            "isArchived": True,
-            "ancestors": [
-                {"id": "old-child", "name": "Old Experiment"},
-                {"id": "old-root", "name": "Old Research"},
+    api_client.app.state.dashboard.snapshot = DashboardSnapshot(
+        df_activity=pd.DataFrame(),
+        db=SimpleNamespace(
+            fetch_projects=lambda include_tasks: [
+                project_factory(project_id="academy", name="Academy"),
+                project_factory(project_id="inbox", name="Inbox"),
+                project_factory(project_id="skynet", name="skynet"),
             ],
-            "rootId": "old-root",
-            "rootName": "Old Research",
-        },
-    ]
-
-    automatic, details = _resolve_automatic_project_mappings(
-        records,
-        manual_mappings={"Old Research": "Academy"},
-        archived_parent_projects=set(),
-    )
-
-    assert automatic == {"Old Experiment": "Academy"}
-    assert details == [
-        {
-            "sourceProject": "Old Experiment",
-            "sourceProjectId": "old-child",
-            "parentProject": "Academy",
-            "parentProjectId": "active-root",
-            "provenance": "automatic",
-        }
-    ]
-
-
-def test_admin_project_adjustments_labels_manual_and_automatic_mappings(
-    monkeypatch, api_client
-) -> None:
-    records = [
-        {
-            "id": "academy",
-            "name": "Academy",
-            "isArchived": False,
-            "ancestors": [{"id": "academy", "name": "Academy"}],
-            "rootId": "academy",
-            "rootName": "Academy",
-        },
-        {
-            "id": "old-root",
-            "name": "Old Root",
-            "isArchived": True,
-            "ancestors": [{"id": "old-root", "name": "Old Root"}],
-            "rootId": "old-root",
-            "rootName": "Old Root",
-        },
-        {
-            "id": "old-child",
-            "name": "Old Child",
-            "isArchived": True,
-            "ancestors": [
-                {"id": "old-child", "name": "Old Child"},
-                {"id": "old-root", "name": "Old Root"},
+            fetch_archived_projects=lambda: [
+                project_factory(project_id="old-root", name="Old Root", is_archived=True),
+                project_factory(
+                    project_id="old-child",
+                    name="Old Child",
+                    parent_id="old-root",
+                    is_archived=True,
+                ),
             ],
-            "rootId": "old-root",
-            "rootName": "Old Root",
-        },
-    ]
-    monkeypatch.setattr(web_api, "_available_mapping_files", lambda: ["map.py"])
-    monkeypatch.setattr(
-        web_api, "_load_mapping_file", lambda filename: ({"Old Root": "Academy"}, [])
-    )
-    monkeypatch.setattr(
-        web_api,
-        "_load_projects_for_adjustments_sync",
-        lambda refresh: (
-            ["Academy"],
-            ["Old Root"],
-            ["Old Child", "Old Root"],
-            [],
-            records,
         ),
     )
 
@@ -151,16 +57,11 @@ def test_admin_project_adjustments_labels_manual_and_automatic_mappings(
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["selectedFile"] == "map.py"
+    assert payload["remappableActiveRootProjects"] == ["Inbox"]
+    assert payload["sourceProjects"] == ["Inbox", "Old Child", "Old Root"]
     assert payload["mappings"] == {"Old Root": "Academy"}
     assert payload["automaticMappings"] == {"Old Child": "Academy"}
-    assert payload["mappingProvenance"] == {
-        "Old Child": "automatic",
-        "Old Root": "manual",
-    }
-    assert payload["unmappedSourceProjects"] == []
-    details = {item["sourceProject"]: item for item in payload["mappingDetails"]}
-    assert details["Old Root"]["parentProjectId"] == "academy"
-    assert details["Old Child"]["sourceProjectId"] == "old-child"
 
 
 def test_admin_project_adjustments_rejects_path_traversal(
@@ -184,19 +85,20 @@ def test_admin_project_adjustments_rejects_path_traversal(
 
 
 def test_admin_save_project_adjustments_roundtrips_safe_literals(
-    monkeypatch, tmp_path, api_client
+    monkeypatch, tmp_path, api_client, project_factory
 ) -> None:
     personal_dir = tmp_path / "personal"
     monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(personal_dir))
     monkeypatch.setattr(
-        web_api,
+        admin_settings,
         "_load_projects_for_adjustments_sync",
-        lambda refresh: (
-            ["Academy / North Wing"],
-            ["Archived Root"],
-            ['Archived "Research"', 'Parent "One"'],
-            ["Inbox"],
-        ),
+        lambda cached_database, refresh: [
+            project_factory(project_id="academy", name="Academy / North Wing"),
+            project_factory(
+                project_id="research", name='Archived "Research"', is_archived=True
+            ),
+            project_factory(project_id="parent", name='Parent "One"', is_archived=True),
+        ],
     )
     response = api_client.put(
         "/api/admin/project_adjustments",
@@ -213,34 +115,134 @@ def test_admin_save_project_adjustments_roundtrips_safe_literals(
     assert "link_adjustements =" in saved
     assert "archived_parent_projects =" in saved
 
-    loaded_mapping, archived_parents = dataframe_module.load_adjustments_file(
+    saved_rules = dataframe_module.load_adjustments_file(
         personal_dir / "adj_private.py"
     )
-    assert loaded_mapping == {'Archived "Research"': "Academy / North Wing"}
-    assert archived_parents == ['Parent "One"']
+    assert saved_rules.mappings == {'Archived "Research"': "Academy / North Wing"}
+    assert saved_rules.archived_parents == ['Parent "One"']
+
+
+def test_guided_project_mapping_roundtrips_project_ids_and_preserves_settings(
+    monkeypatch, tmp_path, api_client, project_factory
+) -> None:
+    monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(tmp_path))
+    path = tmp_path / "projects.py"
+    previous = {"missing": {"targetId": "older", "targetName": "Former group"}}
+    previous_names = {"Archive": "Work", "Former project": "Archive"}
+    previous_parents = ["Former root", "Kept"]
+    path.write_text(
+        dataframe_module.render_adjustments_file_content(
+            previous_names, previous_parents, previous
+        ),
+        encoding="utf-8",
+    )
+    active = [
+        project_factory(project_id="work", name="Work"),
+        project_factory(project_id="child", name="Current", parent_id="work"),
+    ]
+    archived = [
+        project_factory(project_id="archive-a", name="Archive", is_archived=True),
+        project_factory(project_id="archive-b", name="Archive", is_archived=True),
+        project_factory(project_id="kept", name="Kept", is_archived=True),
+    ]
+    api_client.app.state.dashboard.snapshot = DashboardSnapshot(
+        df_activity=pd.DataFrame(),
+        db=SimpleNamespace(
+            fetch_projects=lambda include_tasks: active,
+            fetch_archived_projects=lambda: archived,
+        ),
+    )
+    endpoint = "/api/admin/project_adjustments?file=projects.py"
+    loaded = api_client.get(endpoint)
+    assert loaded.status_code == 200
+    current = loaded.json()
+    by_id = {project["id"]: project for project in current["projects"]}
+    assert set(by_id) == {"work", "child", "archive-a", "archive-b", "kept"}
+    assert by_id["child"]["path"] == "Work / Current"
+    assert by_id["archive-a"]["archived"] and by_id["archive-b"]["archived"]
+    assert current["archivedParentProjects"] == previous_parents
+    assert current["mappings"] == previous_names
+    assert current["projectMappings"] == previous
+
+    archive = {"targetId": "archive-b", "targetName": "Archive"}
+    wanted = {**previous, "archive-b": archive, "child": archive}
+    saved = api_client.put(endpoint, json={"projectMappings": wanted})
+    assert saved.status_code == 200
+    assert saved.json()["projectMappings"] == wanted
+    assert dataframe_module.load_adjustments_file(path) == (
+        previous_names,
+        previous_parents,
+        wanted,
+    )
+
+    bad = {"targetId": "missing-target", "targetName": "Gone"}
+    original = path.read_bytes()
+    assert (
+        api_client.put(endpoint, json={"projectMappings": {"child": bad}}).status_code
+        == 400
+    )
+    assert path.read_bytes() == original
+
+    def fail_replace(source: Path, target: Path) -> Path:
+        assert target == path
+        assert source.parent == path.parent
+        assert source.read_bytes() != original
+        raise OSError("synthetic replace failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", fail_replace)
+        failed = api_client.put(
+            endpoint,
+            json={
+                "projectMappings": {"child": {"targetId": "work", "targetName": "Work"}}
+            },
+        )
+    assert failed.status_code == 503
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]
+    assert api_client.get(endpoint).json()["projectMappings"] == wanted
+
+    updated_names = {**previous_names, "Archive": "Kept"}
+    named_save = api_client.put(
+        endpoint, json={"mappings": updated_names, "archivedParents": previous_parents}
+    )
+    assert named_save.status_code == 200
+    assert named_save.json()["projectMappings"] == wanted
+    assert dataframe_module.load_adjustments_file(path) == (
+        updated_names,
+        previous_parents,
+        wanted,
+    )
+
+    deleted = api_client.put(endpoint, json={"projectMappings": {"child": None}})
+    assert deleted.status_code == 200
+    assert api_client.get(endpoint).json()["projectMappings"] == {
+        **previous,
+        "archive-b": archive,
+    }
 
 
 def test_admin_save_project_adjustments_succeeds_when_refresh_fails(
-    monkeypatch, tmp_path, api_client
+    monkeypatch, tmp_path, api_client, project_factory
 ) -> None:
     personal_dir = tmp_path / "personal"
     monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(personal_dir))
     monkeypatch.setattr(
-        web_api,
+        admin_settings,
         "_load_projects_for_adjustments_sync",
-        lambda refresh: (
-            ["Academy"],
-            ["Archived Root"],
-            ["Archived Research"],
-            ["Inbox"],
-        ),
+        lambda cached_database, refresh: [
+            project_factory(project_id="academy", name="Academy"),
+            project_factory(
+                project_id="archived", name="Archived Research", is_archived=True
+            ),
+        ],
     )
 
-    async def _boom(*, refresh: bool) -> None:
+    async def _boom(state, *, refresh: bool) -> None:
         _ = refresh
         raise MaxRetriesExceeded("Failed to execute list labels after 3 retry attempts")
 
-    monkeypatch.setattr(web_api, "_ensure_state", _boom)
+    monkeypatch.setattr(dashboard_runtime, "ensure_state", _boom)
 
     response = api_client.put(
         "/api/admin/project_adjustments",
@@ -255,11 +257,11 @@ def test_admin_save_project_adjustments_succeeds_when_refresh_fails(
         payload["warning"]
         == "Saved, but dashboard refresh failed (MaxRetriesExceeded)."
     )
-    loaded_mapping, archived_parents = dataframe_module.load_adjustments_file(
+    saved_rules = dataframe_module.load_adjustments_file(
         personal_dir / "adj_private.py"
     )
-    assert loaded_mapping == {"Archived Research": "Academy"}
-    assert archived_parents == []
+    assert saved_rules.mappings == {"Archived Research": "Academy"}
+    assert saved_rules.archived_parents == []
 
 
 @pytest.mark.parametrize(
@@ -276,19 +278,20 @@ def test_admin_save_project_adjustments_succeeds_when_refresh_fails(
     ],
 )
 def test_admin_save_project_adjustments_rejects_active_project_inputs(
-    monkeypatch, tmp_path, body, expected_detail, api_client
+    monkeypatch, tmp_path, body, expected_detail, api_client, project_factory
 ) -> None:
     personal_dir = tmp_path / "personal"
     monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(personal_dir))
     monkeypatch.setattr(
-        web_api,
+        admin_settings,
         "_load_projects_for_adjustments_sync",
-        lambda refresh: (
-            ["Academy"],
-            ["deepflare"],
-            ["deepflare"],
-            ["Inbox"],
-        ),
+        lambda cached_database, refresh: [
+            project_factory(project_id="academy", name="Academy"),
+            project_factory(project_id="deepflare", name="deepflare", is_archived=True),
+            project_factory(
+                project_id="child", name="DeepMhcFlare", parent_id="academy"
+            ),
+        ],
     )
 
     response = api_client.put(
@@ -301,16 +304,14 @@ def test_admin_save_project_adjustments_rejects_active_project_inputs(
     assert expected_detail in response.json()["detail"]
 
 
-def test_admin_dashboard_settings_roundtrip(monkeypatch, tmp_path, api_client) -> None:
+def test_admin_dashboard_settings_roundtrip(tmp_path, api_client) -> None:
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
     (config_dir / "dashboard.yaml").write_text(
         "urgency:\n  enabled: true\n  warn_priority_thresholds: [4, 3]\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(
-        web_api, "_DASHBOARD_CONFIG_PATH", config_dir / "dashboard.yaml"
-    )
+    api_client.app.state.dashboard_config_path = config_dir / "dashboard.yaml"
 
     client = api_client
     res = client.get("/api/admin/dashboard/settings")
@@ -318,9 +319,7 @@ def test_admin_dashboard_settings_roundtrip(monkeypatch, tmp_path, api_client) -
     payload = res.json()
     assert payload["settings"]["enabled"] is True
     assert payload["editTargets"][0]["icon"] == "wrench"
-    assert payload["settings"]["fireLabels"] == [
-        web_api.DEFAULT_URGENCY_SETTINGS["fire_label"]
-    ]
+    assert payload["settings"]["fireLabels"] == [DEFAULT_URGENCY_SETTINGS["fire_label"]]
 
     update = client.put(
         "/api/admin/dashboard/settings",
@@ -381,14 +380,14 @@ def test_admin_dashboard_labels_returns_sorted_local_labels(
         def list_labels(self) -> list[dict[str, str]]:
             return list(self._items)
 
-    monkeypatch.setattr(web_api, "Database", _FakeDatabase)
+    monkeypatch.setattr(admin_settings, "Database", _FakeDatabase)
 
     res = api_client.get("/api/admin/dashboard/labels")
     assert res.status_code == 200
     payload = res.json()
     assert payload["labels"] == [
         {"name": "alpha", "color": "#0000ff"},
-        {"name": web_api.DEFAULT_URGENCY_SETTINGS["fire_label"], "color": None},
+        {"name": DEFAULT_URGENCY_SETTINGS["fire_label"], "color": None},
         {"name": "zeta", "color": "#ff0000"},
     ]
 
@@ -407,14 +406,17 @@ def test_removed_runtime_features_have_no_routes(api_client, path: str) -> None:
     assert api_client.get(path).status_code == 404
 
 
-def test_dashboard_settings_create_directory_and_invalidate_home(
+def test_dashboard_settings_create_directory_and_update_overview(
     monkeypatch, tmp_path, api_client
 ):
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path / "cache"))
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
     path = tmp_path / "new-configs" / "dashboard.yaml"
-    monkeypatch.setattr(web_api, "_DASHBOARD_CONFIG_PATH", path)
-    monkeypatch.setattr(
-        web_api._state, "home_payload_cache", {("home",): {"stale": True}}
-    )
+    api_client.app.state.dashboard_config_path = path
+    api_client.app.state.dashboard.snapshot = DashboardSnapshot(_single_event_df())
+    overview = "/api/dashboard/home?cached_only=true"
+    before = api_client.get(overview).json()["configurableItems"][0]["summary"]
     response = api_client.put(
         "/api/admin/dashboard/settings",
         json={
@@ -427,7 +429,9 @@ def test_dashboard_settings_create_directory_and_invalidate_home(
         },
     )
     assert response.status_code == 200
-    assert web_api._state.home_payload_cache == {}
+    after = api_client.get(overview).json()["configurableItems"][0]["summary"]
+    assert after != before
+    assert "Priority thresholds []" in after
     reread = api_client.get("/api/admin/dashboard/settings").json()["settings"]
     assert reread["fireLabels"] == []
     assert reread["warnPriorityThresholds"] == []
@@ -453,12 +457,10 @@ def test_dashboard_settings_create_directory_and_invalidate_home(
         {"plotEvents": [{"date": "2026-11-01", "label": "Launch", "color": "garbage"}]},
     ],
 )
-def test_invalid_settings_do_not_modify_saved_rules(
-    monkeypatch, tmp_path, api_client, patch
-):
+def test_invalid_settings_do_not_modify_saved_rules(tmp_path, api_client, patch):
     path = tmp_path / "dashboard.yaml"
     path.write_text("urgency:\n  enabled: true\n  warn_priority_thresholds: [4]\n")
-    monkeypatch.setattr(web_api, "_DASHBOARD_CONFIG_PATH", path)
+    api_client.app.state.dashboard_config_path = path
     before = path.read_bytes()
     response = api_client.put("/api/admin/dashboard/settings", json=patch)
     assert response.status_code == 400
@@ -467,37 +469,22 @@ def test_invalid_settings_do_not_modify_saved_rules(
 
 
 def test_concurrent_partial_settings_updates_preserve_each_other(monkeypatch, tmp_path):
-    import asyncio
-    import httpx
-
     path = tmp_path / "dashboard.yaml"
     path.write_text("urgency:\n  enabled: true\n  warn_priority_thresholds: [4]\n")
-    monkeypatch.setattr(web_api, "_DASHBOARD_CONFIG_PATH", path)
+    monkeypatch.setenv("TODOIST_CONFIG_DIR", str(tmp_path))
+    endpoint = "/api/admin/dashboard/settings"
 
-    async def run():
-        lock = asyncio.Lock()
-        monkeypatch.setattr(web_api, "_ADMIN_LOCK", lock)
-        await lock.acquire()
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=web_api.app), base_url="http://test"
-        ) as client:
-            first = asyncio.create_task(
-                client.put("/api/admin/dashboard/settings", json={"enabled": False})
-            )
-            second = asyncio.create_task(
-                client.put(
-                    "/api/admin/dashboard/settings",
-                    json={"warnPriorityThresholds": [2]},
-                )
-            )
-            await asyncio.sleep(0)
-            lock.release()
-            responses = await asyncio.gather(first, second)
-            assert all(response.status_code == 200 for response in responses)
-            settings = (await client.get("/api/admin/dashboard/settings")).json()[
-                "settings"
-            ]
-            assert settings["enabled"] is False
-            assert settings["warnPriorityThresholds"] == [2]
-
-    asyncio.run(run())
+    with (
+        TestClient(create_app()) as first,
+        TestClient(create_app()) as second,
+        ThreadPoolExecutor(max_workers=2) as workers,
+    ):
+        disable = workers.submit(first.put, endpoint, json={"enabled": False})
+        threshold = workers.submit(
+            second.put, endpoint, json={"warnPriorityThresholds": [2]}
+        )
+        assert disable.result(timeout=5).status_code == 200
+        assert threshold.result(timeout=5).status_code == 200
+        settings = first.get(endpoint).json()["settings"]
+        assert settings["enabled"] is False
+        assert settings["warnPriorityThresholds"] == [2]

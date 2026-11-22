@@ -4,7 +4,7 @@ export type AdminApiTokenStatus = {
   envPath: string;
 };
 
-export type AdminApiTokenSaveResponse = AdminApiTokenStatus & {
+type AdminApiTokenSaveResponse = AdminApiTokenStatus & {
   validated?: boolean;
   labelsCount?: number | null;
 };

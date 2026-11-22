@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.Function;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -104,32 +105,10 @@ final class DashboardModel {
       known.put(all.getJSONObject(i).getString("id"), all.getJSONObject(i));
     for (int i = 0; i < active.length(); i++)
       known.put(active.getJSONObject(i).getString("id"), active.getJSONObject(i));
-    JSONObject adjustments = snapshot.optJSONObject("adjustments");
-    JSONObject mappings =
-        adjustments == null ? new JSONObject() : adjustments.optJSONObject("mappings");
-    if (mappings == null) mappings = new JSONObject();
-    JSONObject projectMappings =
-        adjustments == null ? null : adjustments.optJSONObject("projectMappings");
-    if (projectMappings == null) projectMappings = new JSONObject();
-    JSONArray promoted = adjustments == null ? null : adjustments.optJSONArray("archivedParents");
-    this.adjustments =
-        new JSONObject()
-            .put("mappings", new JSONObject(mappings.toString()))
-            .put("projectMappings", new JSONObject(projectMappings.toString()))
-            .put(
-                "archivedParents",
-                promoted == null ? new JSONArray() : new JSONArray(promoted.toString()));
-    java.util.Set<String> promotedNames = new java.util.HashSet<>();
-    if (promoted != null)
-      for (int i = 0; i < promoted.length(); i++) promotedNames.add(promoted.optString(i));
-    JSONObject savedMappings = mappings;
-    JSONObject savedProjectMappings = projectMappings;
-    Map<String, String> rootNames = new HashMap<>();
-    java.util.function.Function<String, String> rootFor =
-        id ->
-            rootNames.computeIfAbsent(
-                id,
-                key -> rootName(key, known, savedMappings, savedProjectMappings, promotedNames));
+    ProjectAdjustments saved =
+        ProjectAdjustments.fromSnapshot(snapshot.optJSONObject("adjustments"));
+    adjustments = saved.toJson();
+    Function<String, String> rootFor = saved.resolver(known)::rootName;
     java.util.Set<String> archivedRoots = new java.util.HashSet<>();
     for (var project : known.values())
       if (project.optBoolean("is_archived"))
@@ -443,142 +422,5 @@ final class DashboardModel {
         event.isNull("v2_parent_project_id") ? "" : event.optString("v2_parent_project_id", "");
     if (!projects.containsKey(primary) && projects.containsKey(modern)) return modern;
     return primary.isEmpty() ? modern : primary;
-  }
-
-  static String rootName(
-      String id,
-      Map<String, JSONObject> projects,
-      JSONObject mappings,
-      JSONObject projectMappings,
-      java.util.Set<String> promoted) {
-    String resolved =
-        resolveRoot(id, projects, mappings, projectMappings, promoted, new java.util.HashSet<>());
-    if (resolved != null) return resolved;
-    // Ignore a cyclic manual assignment rather than merging unrelated projects.
-    String name = "Unknown project";
-    java.util.Set<String> visited = new java.util.HashSet<>();
-    while (!id.isEmpty() && visited.add(id)) {
-      JSONObject project = projects.get(id);
-      if (project == null) break;
-      name = rootLabel(project, projects);
-      if (project.optBoolean("is_archived") && promoted.contains(project.optString("name")))
-        return name;
-      id = TodoistClient.parentId(project);
-    }
-    return name;
-  }
-
-  private static String resolveRoot(
-      String id,
-      Map<String, JSONObject> projects,
-      JSONObject mappings,
-      JSONObject projectMappings,
-      java.util.Set<String> promoted,
-      java.util.Set<String> assignments) {
-    if (!assignments.add(id)) return null;
-    String name = "Unknown project";
-    java.util.Set<String> visited = new java.util.HashSet<>();
-    List<JSONObject> ancestors = new ArrayList<>();
-    while (!id.isEmpty() && visited.add(id)) {
-      JSONObject project = projects.get(id);
-      if (project == null) break;
-      ancestors.add(project);
-      name = project.optString("name", name);
-      id = TodoistClient.parentId(project);
-    }
-    // A specific legacy choice beats an inherited ID rule; the ID wins on the
-    // same project. With no ID rule, retain the original legacy precedence.
-    JSONObject closerLegacy = null;
-    boolean closerPromoted = false;
-    for (var project : ancestors) {
-      String sourceId = project.optString("id");
-      JSONObject target = projectMappings.optJSONObject(sourceId);
-      if (target != null) {
-        String targetId = target.optString("targetId", "");
-        String targetName = target.optString("targetName", "");
-        if (!targetId.isEmpty() && !targetName.isEmpty()) {
-          if (closerLegacy != null) {
-            if (closerPromoted) return rootLabel(closerLegacy, projects);
-            return mappedRoot(
-                mappings.optString(closerLegacy.optString("name")),
-                projects,
-                mappings,
-                projectMappings,
-                promoted,
-                assignments);
-          }
-          if (sourceId.equals(targetId)) return rootLabel(project, projects);
-          if (!projects.containsKey(targetId)) return targetName + " · " + targetId;
-          return resolveRoot(targetId, projects, mappings, projectMappings, promoted, assignments);
-        }
-      }
-      if (closerLegacy == null && project.optBoolean("is_archived")) {
-        String source = project.optString("name");
-        if (promoted.contains(source)) {
-          closerLegacy = project;
-          closerPromoted = true;
-        } else if (mappings.has(source) && !mappings.optString(source, source).equals(source)) {
-          closerLegacy = project;
-        }
-      }
-    }
-    for (var project : ancestors)
-      if (project.optBoolean("is_archived") && promoted.contains(project.optString("name")))
-        return rootLabel(project, projects);
-    for (var project : ancestors) {
-      String source = project.optString("name");
-      if (project.optBoolean("is_archived") && mappings.has(source)) {
-        String target = mappings.optString(source, name);
-        if (!target.equals(source))
-          return mappedRoot(target, projects, mappings, projectMappings, promoted, assignments);
-      }
-    }
-    return mappings.has(name) && !mappings.optString(name, name).equals(name)
-        ? mappedRoot(
-            mappings.optString(name, name),
-            projects,
-            mappings,
-            projectMappings,
-            promoted,
-            assignments)
-        : ancestors.isEmpty() ? name : rootLabel(ancestors.get(ancestors.size() - 1), projects);
-  }
-
-  private static String rootLabel(JSONObject project, Map<String, JSONObject> projects) {
-    String name = project.optString("name", "Unknown project");
-    String id = project.optString("id", "");
-    for (var other : projects.values())
-      if (!id.equals(other.optString("id")) && name.equals(other.optString("name")))
-        return name + " · " + id;
-    return name;
-  }
-
-  private static String mappedRoot(
-      String target,
-      Map<String, JSONObject> projects,
-      JSONObject mappings,
-      JSONObject projectMappings,
-      java.util.Set<String> promoted,
-      java.util.Set<String> assignments) {
-    String active = null, archived = null;
-    int activeMatches = 0, archivedMatches = 0;
-    for (var entry : projects.entrySet()) {
-      JSONObject project = entry.getValue();
-      if (!target.equals(project.optString("name"))) continue;
-      if (project.optBoolean("is_archived")) {
-        archived = entry.getKey();
-        archivedMatches++;
-      } else {
-        active = entry.getKey();
-        activeMatches++;
-      }
-    }
-    // Match desktop's preference for a unique active project. Do not guess
-    // between duplicates; a missing target remains an explicit named bucket.
-    String id =
-        activeMatches == 1 ? active : activeMatches == 0 && archivedMatches == 1 ? archived : null;
-    return id == null
-        ? target
-        : resolveRoot(id, projects, mappings, projectMappings, promoted, assignments);
   }
 }

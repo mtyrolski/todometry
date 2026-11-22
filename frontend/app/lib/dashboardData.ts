@@ -7,7 +7,7 @@ export type Health = { status: string; version?: string } | null;
 
 export type Granularity = "W" | "ME" | "3ME";
 
-export type DashboardFigures = {
+type DashboardFigures = {
   weeklyCompletionTrend?: PlotlyFigure;
   taskCountTrend?: PlotlyFigure;
   taskLifespans?: PlotlyFigure;
@@ -19,7 +19,25 @@ export type DashboardFigures = {
   activeProjectHierarchy?: PlotlyFigure;
 };
 
-export type ConfigurableItem = {
+export type HistoryRange = { beg: string; end: string };
+
+export type ActivitySync = {
+  state: "idle" | "running" | "failed" | "succeeded";
+  error: string | null;
+  startedAt: string | null;
+  newEvents: number | null;
+  dashboardError?: string;
+};
+
+export type HistoryCharts = {
+  range: HistoryRange & { mode: "custom" };
+  rangeHasActivity: boolean;
+  figures: Pick<DashboardFigures, "activeProjectHierarchy" | "eventsOverTime" | "heatmapEventsByDayHour" | "taskLifespansPeriod">;
+  refreshedAt: string;
+  timeZone: string;
+};
+
+type ConfigurableItem = {
   key: string;
   label: string;
   icon?: string;
@@ -28,7 +46,7 @@ export type ConfigurableItem = {
   summary?: string;
 };
 
-export type HabitTrackerItem = {
+type HabitTrackerItem = {
   taskId: string;
   name: string;
   projectId: string;
@@ -42,10 +60,8 @@ export type HabitTrackerItem = {
 };
 
 export type DashboardHome = {
-  refreshing?: boolean;
-  refreshWarning?: string | null;
+  sync: ActivitySync;
   noData?: boolean;
-  rangeHasActivity?: boolean;
   range: { beg: string; end: string; mode: "rolling" | "custom"; granularity: Granularity; weeks: number };
   metrics: {
     items: {
@@ -88,7 +104,6 @@ export type DashboardHome = {
     };
   };
   figures: DashboardFigures;
-  projectTimelineSummary?: { parentCount: number; subprojectCount: number };
   configurableItems?: ConfigurableItem[];
   refreshedAt: string;
   error?: string;
@@ -96,8 +111,6 @@ export type DashboardHome = {
 
 export type DashboardStatus = {
   services: ServiceStatus[];
-  configurableItems?: ConfigurableItem[];
   apiCache: { lastRefresh: string | null };
   activityCache: { path: string; mtime: string | null; size: number | null } | null;
-  now: string;
 };

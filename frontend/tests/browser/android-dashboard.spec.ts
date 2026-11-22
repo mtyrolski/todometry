@@ -165,9 +165,9 @@ test.beforeEach(async ({ page }) => {
         dailyActivity: [makeDay("2026-09-30", 2, 7), makeDay("2026-10-01", 4, 0), makeDay("2026-10-12", 1, 7), makeDay("2026-10-19", 1, 0), makeDay("2026-10-26", 1, 0), makeDay("2026-11-02", 3, 0)],
         lifespans: [{ completedAt: "2026-10-01", seconds: 60 }, { completedAt: "2026-10-02", seconds: 86400 }],
         hierarchy: [
-          { id: "work", name: "Work", parentId: "", rootName: "Work", color: "blue", archived: false, createdAt: "2026-09-01", lastEventAt: "2026-11-02", archivedAt: "", openTasks: 1, dailyCompletions: [{date: "2026-10-01", count: 4}, {date: "2026-11-02", count: 3}], dailyEvents: [{date: "2026-10-01", count: 4}, {date: "2026-10-02", count: 1}, {date: "2026-11-02", count: 3}], weeklyCounts: { 7: 10, 8: 3 } },
-          { id: "old", name: "Reopened", parentId: "work", rootName: "Work", color: "blue", archived: false, createdAt: "2026-09-01", lastEventAt: "2026-10-01", archivedAt: "2025-01-01", weeklyCounts: { 7: 1 } },
-          { id: "old-two", name: "Reopened", parentId: "work", rootName: "Work", color: "blue", archived: false, createdAt: "2026-09-02", lastEventAt: "2026-10-01", archivedAt: "", weeklyCounts: { 7: 1 } },
+          { id: "work", name: "Work", parentId: "", rootName: "Work", archived: false, createdAt: "2026-09-01", archivedAt: "", dailyCompletions: [{date: "2026-10-01", count: 4}, {date: "2026-11-02", count: 3}], dailyEvents: [{date: "2026-10-01", count: 4}, {date: "2026-10-02", count: 1}, {date: "2026-11-02", count: 3}], weeklyCounts: { 7: 10, 8: 3 } },
+          { id: "old", name: "Reopened", parentId: "work", rootName: "Work", archived: false, createdAt: "2026-09-01", archivedAt: "2025-01-01", weeklyCounts: { 7: 1 } },
+          { id: "old-two", name: "Reopened", parentId: "work", rootName: "Work", archived: false, createdAt: "2026-09-02", archivedAt: "", weeklyCounts: { 7: 1 } },
         ],
         taskCounts: [{ date: "2026-11-01", total: 2, p1: 1, p2: 1, p3: 0, p4: 0 }, { date: "2026-11-02", total: 3, p1: 2, p2: 1, p3: 0, p4: 0 }],
       };
@@ -180,8 +180,8 @@ test.beforeEach(async ({ page }) => {
       const work = data.hierarchy[0];
       work.dailyEvents = Array.from({ length: 90 }, (_, i) => ({ date: new Date(Date.UTC(2026, 0, i + 1)).toISOString().slice(0, 10), count: 1 }));
       work.dailyCompletions = work.dailyEvents;
-      for (let i = 0; i < 25; i++) data.hierarchy.push({ id: `p${i}`, name: `Project ${i}`, rootName: `Project ${i}`, parentId: "", archived: i === 0, createdAt: "2026-01-01", lastEventAt: "", archivedAt: "", dailyEvents: [], dailyCompletions: [], weeklyCounts: {} });
-      data.hierarchy.push({ id: "unknown", name: "Unknown project", rootName: "Unknown project", parentId: "", archived: false, metadataKnown: false, createdAt: "", lastEventAt: "", archivedAt: "", dailyEvents: [], dailyCompletions: [], weeklyCounts: {} });
+      for (let i = 0; i < 25; i++) data.hierarchy.push({ id: `p${i}`, name: `Project ${i}`, rootName: `Project ${i}`, parentId: "", archived: i === 0, createdAt: "2026-01-01", archivedAt: "", dailyEvents: [], dailyCompletions: [], weeklyCounts: {} });
+      data.hierarchy.push({ id: "unknown", name: "Unknown project", rootName: "Unknown project", parentId: "", archived: false, metadataKnown: false, createdAt: "", archivedAt: "", dailyEvents: [], dailyCompletions: [], weeklyCounts: {} });
       model.tasks.push({ id: "child", parentId: "a", projectId: "work", project: "Work", content: "A subtask", priority: 1, due: "", deadline: "", labels: [] } as typeof model.tasks[number]);
       send();
     });
@@ -251,8 +251,8 @@ test.beforeEach(async ({ page }) => {
     window.addEventListener("test-grouping-account", () => {
       window.dispatchEvent(new Event("test-analysis"));
       const data = (model as typeof model & { plotData: { hierarchy: Record<string, unknown>[] }; adjustments: unknown });
-      for (const id of ["one", "two"]) data.plotData.hierarchy.push({ id, name: "Old", rootName: "Work", parentId: "", archived: true, createdAt: "2026-09-01", lastEventAt: "2026-10-01", archivedAt: "2026-10-01", weeklyCounts: {} });
-      data.plotData.hierarchy.push({ id: "life", name: "Personal", rootName: "Personal", parentId: "", archived: false, createdAt: "2026-09-01", lastEventAt: "2026-10-01", archivedAt: "", weeklyCounts: {} });
+      for (const id of ["one", "two"]) data.plotData.hierarchy.push({ id, name: "Old", rootName: "Work", parentId: "", archived: true, createdAt: "2026-09-01", archivedAt: "2026-10-01", weeklyCounts: {} });
+      data.plotData.hierarchy.push({ id: "life", name: "Personal", rootName: "Personal", parentId: "", archived: false, createdAt: "2026-09-01", archivedAt: "", weeklyCounts: {} });
       data.adjustments = { mappings: { Old: "Work", Missing: "Gone", Conflict: "Other" }, archivedParents: ["Legacy", "Conflict"] };
       state.demo = false;
       state.connected = true;
@@ -291,6 +291,7 @@ test.beforeEach(async ({ page }) => {
     window.Todoist = {
       ready: send,
       command: (name: string, argument: string) => {
+        let acknowledgement: string | undefined;
         if (name === "close") sessionStorage.setItem("test-close", "yes");
         if (name === "demo") {
           state.demo = true;
@@ -303,13 +304,17 @@ test.beforeEach(async ({ page }) => {
           sessionStorage.removeItem("test-demo");
         }
         if (name === "save-adjustments" && state.model) {
-          const { mappings, archivedParents, projectMappings } = JSON.parse(argument);
+          const { mappings, archivedParents, projectMappings, requestId } = JSON.parse(argument);
           (model as typeof model & { adjustments: unknown }).adjustments = { mappings, archivedParents, projectMappings };
           sessionStorage.setItem("test-saved-adjustments", JSON.stringify({ mappings, archivedParents, projectMappings }));
           state.message = "Project adjustments saved.";
+          acknowledgement = requestId;
         }
         if (name === "import-adjustments") sessionStorage.setItem("test-import-requested", "yes");
         send();
+        if (acknowledgement) window.dispatchEvent(new CustomEvent("todoist-adjustments-result", {
+          detail: { requestId: acknowledgement, error: null },
+        }));
       },
       getSettings: () => JSON.stringify(state.preferences),
       saveSettings: (json: string) => {
@@ -1016,6 +1021,101 @@ test("mobile exposes desktop plots with calendar-accurate totals and respects pa
   await page.getByRole("combobox", { name: "Range", exact: true }).selectOption("4");
   await page.getByRole("combobox", { name: "Period", exact: true }).selectOption("month");
   await expect.poll(() => completed.evaluate((node) => (node as HTMLElement & { data: unknown[] }).data.length)).toBe(0);
+});
+
+test("Android guided grouping waits for its save result and reopens the saved selection", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("button", { name: "Back to my data", exact: true }).click();
+  await page.evaluate(() => {
+    const bridge = window.Todoist;
+    if (!bridge) throw new Error("Missing Android bridge");
+    const original = bridge.command;
+    let pendingSave: string | null = null;
+    bridge.command = (name, argument) => {
+      if (name === "sync") {
+        window.dispatchEvent(new CustomEvent("todoist-state", {
+          detail: { syncing: true, message: "Syncing project metadata." },
+        }));
+      } else if (name === "save-adjustments") {
+        pendingSave = argument;
+        sessionStorage.setItem("test-pending-adjustments", argument);
+      } else original(name, argument);
+    };
+    window.addEventListener("test-complete-adjustments-save", (event) => {
+      if (!pendingSave) throw new Error("Missing pending adjustment save");
+      const error = (event as CustomEvent<string | null>).detail;
+      if (error) {
+        const { requestId } = JSON.parse(pendingSave);
+        window.dispatchEvent(new CustomEvent("todoist-adjustments-result", {
+          detail: { requestId, error },
+        }));
+      } else original("save-adjustments", pendingSave);
+      pendingSave = null;
+    });
+  });
+  await page.getByLabel("API token").fill("test-token");
+  await page.getByRole("button", { name: "Connect and sync" }).click();
+  const dialog = page.getByRole("dialog", { name: "Project mapping" });
+  await expect(page.getByText("Syncing project metadata.")).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await page.evaluate(() => window.dispatchEvent(new Event("test-grouping-account")));
+  await expect(dialog.getByRole("button", { name: "Skip setup" })).toBeVisible();
+  await dialog.getByRole("checkbox", { name: "Old · archived · ID two" }).check();
+  await dialog.getByRole("checkbox", { name: "Work", exact: true }).check();
+  await dialog.getByRole("button", { name: "Continue" }).click();
+  await dialog.getByLabel("Go to project").selectOption("old");
+  await expect(dialog.getByRole("heading", { name: "Work / Reopened · ID old", exact: true })).toBeVisible();
+  await dialog.getByLabel("Group under").selectOption("two");
+  await dialog.getByRole("button", { name: "Save project mapping" }).click();
+  await expect(dialog.getByRole("button", { name: "Saving…" })).toBeDisabled();
+  const pendingSave = () => page.evaluate(() => JSON.parse(sessionStorage.getItem("test-pending-adjustments") ?? "null"));
+  await expect.poll(async () => (await pendingSave())?.requestId).toEqual(expect.any(String));
+  const first = await pendingSave();
+  expect(await page.evaluate(() => sessionStorage.getItem("test-saved-adjustments"))).toBeNull();
+  await page.evaluate((requestId) => {
+    window.dispatchEvent(new CustomEvent("todoist-state", { detail: { message: "Project adjustments saved." } }));
+    window.dispatchEvent(new CustomEvent("todoist-adjustments-result", {
+      detail: { requestId: `stale-${requestId}`, error: null },
+    }));
+    window.dispatchEvent(new Event("todoist-back"));
+  }, first.requestId);
+  await expect(dialog.getByRole("button", { name: "Saving…" })).toBeDisabled();
+
+  const failure = "Project adjustments are unavailable right now. Try again when the account is ready.";
+  await page.evaluate((error) => window.dispatchEvent(new CustomEvent("test-complete-adjustments-save", { detail: error })), failure);
+  await expect(dialog.getByRole("alert")).toHaveText(failure);
+  await expect(dialog.getByLabel("Group under")).toHaveValue("two");
+  await dialog.getByRole("button", { name: "Save project mapping" }).click();
+  await expect.poll(async () => (await pendingSave())?.requestId).not.toBe(first.requestId);
+  const retry = await pendingSave();
+  expect(retry).toEqual({ ...first, requestId: expect.any(String) });
+  await page.evaluate(() => window.dispatchEvent(new CustomEvent("test-complete-adjustments-save", { detail: null })));
+  await expect(dialog).toHaveCount(0);
+  const saved = () => page.evaluate(() => JSON.parse(sessionStorage.getItem("test-saved-adjustments") ?? "{}"));
+  const stored = {
+    mappings: { Old: "Work", Missing: "Gone", Conflict: "Other" },
+    archivedParents: ["Legacy", "Conflict"],
+    projectMappings: {
+      two: { targetId: "two", targetName: "Old" },
+      work: { targetId: "work", targetName: "Work" },
+      old: { targetId: "two", targetName: "Old" },
+    },
+  };
+  expect(await saved()).toEqual(stored);
+
+  await page.getByRole("button", { name: "Control Panel", exact: true }).click();
+  await page.getByRole("region", { name: "Project grouping" }).getByRole("button", { name: "Guided setup" }).click();
+  const setup = page.getByRole("region", { name: "Project mapping setup" });
+  await expect(setup.getByRole("checkbox", { name: "Old · archived · ID two" })).toBeChecked();
+  await setup.getByRole("button", { name: "Continue" }).click();
+  await setup.getByLabel("Go to project").selectOption("old");
+  await expect(setup.getByLabel("Group under")).toHaveValue("two");
+  await setup.getByLabel("Group under").selectOption("work");
+  await setup.getByRole("button", { name: "Skip project" }).click();
+  await setup.getByRole("button", { name: "Save project mapping" }).click();
+  await expect(setup).toHaveCount(0);
+  expect(await pendingSave()).toEqual(retry);
+  expect(await saved()).toEqual(stored);
 });
 
 test("project groupings can be edited, promoted, imported, and kept when names are missing", async ({ page }) => {

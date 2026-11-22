@@ -18,19 +18,15 @@ while recurring occurrences remain separate.
 
 - **Overview** shows completion trends, task lifespans, project contributions,
   priority counts and configurable attention alerts.
-- **Activity History** loads saved activity for a day, week, month, year or
-  custom date range when you select **Load charts**.
+- **Activity History** lets you browse saved events by year, month, week and day
+  and opens charts for the selected period. You can also enter a custom date range.
 - **Project Timeline** shows active and archived subprojects over time. Project
   Adjustments lets you correct their local hierarchy.
-- **Background refresh** can update stale data when Overview opens. Use
-  **Refresh** in Overview to sync again while staying on the page.
+- **Background refresh** can update stale data when Overview opens. **Refresh
+  data** opens Activity History and starts or joins a sync in the background.
 - **Habit data** for tasks labelled `track_habit` is included in the dashboard
-  API payload. This branch does not have a dedicated habit-tracking screen.
+  payload.
 - **Control Panel and Live Logs** provide local settings, status and log access.
-
-A separate observer automation, stale-task maintenance and the optional
-read-only Codex executive review are not implemented on this branch. They are
-not required to run the dashboard.
 
 ## Install or run from source
 
@@ -55,6 +51,15 @@ copy `.env.example` to `.env` and set `API_KEY`. Data and credentials stay in
 local files; the app contacts Todoist to sync. See [architecture and local
 state](docs/ARCHITECTURE.md) for paths and configuration overrides.
 
+After saving your token in the app, choose main projects, including archived
+projects, and assign others one at a time. You can save a partial setup and
+reopen it from **Project Adjustments → Guided setup**.
+
+In Activity History, choose a year, month, week or day to load its charts.
+Event counts come from saved activity, including events saved before sync
+coverage was tracked. **Sync coverage** shows which periods were checked, and
+**Sync now** checks for new activity in the background.
+
 ```bash
 make sync            # fetch recent activity
 make sync_history    # fetch recent and older history
@@ -65,8 +70,10 @@ make run_demo        # explore anonymized local sample data
 ## Android
 
 The Android app syncs directly with Todoist and stores its history on the phone.
-Saved data and the built-in demo work offline. You can export project adjustments
-from the desktop Control Panel and import them on the phone.
+Saved data and the built-in demo work offline. The shared guided setup opens
+after the first sync from the connection form and is available later in
+**Control Panel → Project grouping**. Export project adjustments from desktop
+Project Adjustments to import them on the phone.
 
 <img src="img/android.webp" width="340" alt="Android dashboard with sample data">
 
@@ -92,5 +99,5 @@ npm --prefix frontend exec -- playwright install chromium
 make ci
 ```
 
-The [architecture guide](docs/ARCHITECTURE.md) describes the current boundaries,
-known web-backend debt and state compatibility requirements.
+For runtime ownership, synchronization and saved-state compatibility, see the
+[architecture guide](docs/ARCHITECTURE.md).

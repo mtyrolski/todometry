@@ -25,6 +25,7 @@ class LoadCase(NamedTuple):
     archived_parents: set[str]
     expected_name: str
     expected_id: str | None
+    individual: dict[str, dataframe_module.ProjectIdRule] | None = None
 
 
 def _project(spec: ProjectSpec) -> Project:
@@ -60,17 +61,21 @@ def _event(project_id: str) -> Event:
     )
 
 
-def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
-    projects = {spec.id: _project(spec) for spec in case.projects}
-    specs = {spec.id: spec for spec in case.projects}
-    active = [project for spec, project in zip(case.projects, projects.values()) if not spec.archived]
-    archived = [project for spec, project in zip(case.projects, projects.values()) if spec.archived]
+def _load_adjusted_activity(
+    monkeypatch: pytest.MonkeyPatch,
+    specs: Sequence[ProjectSpec],
+    event_project_ids: Sequence[str],
+    adjustments: dataframe_module.ProjectAdjustments,
+):
+    projects = {spec.id: _project(spec) for spec in specs}
+    active = [projects[spec.id] for spec in specs if not spec.archived]
+    archived = [projects[spec.id] for spec in specs if spec.archived]
 
     class _FakeCache:
         class _ActivityStore:
             @staticmethod
             def load():
-                return {_event(case.event_project_id)}
+                return {_event(project_id) for project_id in event_project_ids}
 
         def __init__(self) -> None:
             self.activity = self._ActivityStore()
@@ -78,14 +83,7 @@ def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
     class _FakeDatabase:
         @staticmethod
         def fetch_mapping_project_id_to_root():
-            return {
-                spec.id: projects[spec.root_id or spec.id]
-                for spec in specs.values()
-            }
-
-        @staticmethod
-        def fetch_mapping_project_id_to_name():
-            return {spec.id: spec.name for spec in specs.values()}
+            return {spec.id: projects[spec.root_id or spec.id] for spec in specs}
 
         @staticmethod
         def fetch_projects(include_tasks: bool = False):
@@ -98,14 +96,7 @@ def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
 
     monkeypatch.setattr(dataframe_module, "Cache", _FakeCache)
     monkeypatch.setattr(
-        dataframe_module,
-        "get_adjusting_mapping",
-        lambda specific_file=None: case.adjustments,
-    )
-    monkeypatch.setattr(
-        dataframe_module,
-        "get_adjusting_archived_parent_projects",
-        lambda specific_file=None: case.archived_parents,
+        dataframe_module, "load_project_adjustments", lambda: adjustments
     )
     return dataframe_module.load_activity_data(cast(Database, _FakeDatabase()))
 
@@ -148,7 +139,9 @@ def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
                 projects=[
                     ProjectSpec("archived-root", "OldRoot", True),
                     ProjectSpec("deepflare", "Deepflare", True, "archived-root"),
-                    ProjectSpec("deepflare-child", "Deepflare Child", True, "deepflare"),
+                    ProjectSpec(
+                        "deepflare-child", "Deepflare Child", True, "deepflare"
+                    ),
                 ],
                 event_project_id="deepflare-child",
                 adjustments={"Deepflare Child": "Deepflare"},
@@ -192,7 +185,9 @@ def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
             LoadCase(
                 projects=[
                     ProjectSpec("academy", "Academy", False),
-                    ProjectSpec("deep-mhc-flare", "DeepMhcFlare", False, "academy", "academy"),
+                    ProjectSpec(
+                        "deep-mhc-flare", "DeepMhcFlare", False, "academy", "academy"
+                    ),
                     ProjectSpec("deepflare", "deepflare", True),
                 ],
                 event_project_id="deep-mhc-flare",
@@ -203,12 +198,40 @@ def _load_activity_case(monkeypatch: pytest.MonkeyPatch, case: LoadCase):
             ),
             id="does-not-map-active-child-via-archived-adjustment",
         ),
+        pytest.param(
+            LoadCase(
+                projects=[
+                    ProjectSpec("work", "Work", False),
+                    ProjectSpec("child", "Current", False, "work", "work"),
+                    ProjectSpec("leaf", "Leaf", False, "child", "work"),
+                    ProjectSpec("archived-a", "Archive", True),
+                    ProjectSpec("archived-b", "Archive", True, "work", "work"),
+                ],
+                event_project_id="leaf",
+                adjustments={"Archive": "Work"},
+                archived_parents=set(),
+                expected_name="Archive · archived-b",
+                expected_id="archived-b",
+                individual={
+                    "archived-b": {"targetId": "archived-b", "targetName": "Archive"},
+                    "child": {"targetId": "archived-b", "targetName": "Archive"},
+                },
+            ),
+            id="individually-maps-active-branch-to-selected-archived-name-twin",
+        ),
     ],
 )
 def test_load_activity_data_root_adjustments(
     monkeypatch: pytest.MonkeyPatch, case: LoadCase
 ) -> None:
-    df = _load_activity_case(monkeypatch, case)
+    df = _load_adjusted_activity(
+        monkeypatch,
+        case.projects,
+        (case.event_project_id,),
+        dataframe_module.ProjectAdjustments(
+            case.adjustments, sorted(case.archived_parents), case.individual or {}
+        ),
+    )
 
     assert len(df) == 1
     assert df.iloc[0]["root_project_name"] == case.expected_name
@@ -216,7 +239,98 @@ def test_load_activity_data_root_adjustments(
         assert df.iloc[0]["root_project_id"] == case.expected_id
 
 
-def test_get_adjusting_mapping_uses_env_personal_dir_and_safe_literals(
+def test_activity_reports_and_hierarchy_agree_on_partial_project_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projects = [
+        ProjectSpec("work", "Work", False),
+        ProjectSpec("child", "Current", False, "work", "work"),
+        ProjectSpec("leaf", "Leaf", False, "child", "work"),
+        ProjectSpec("active-archive", "Archive", False),
+        ProjectSpec("archive-a", "Archive", True),
+        ProjectSpec("archive-b", "Archive", True, "work", "work"),
+        ProjectSpec("old", "Old", True),
+        ProjectSpec("earlier", "Earlier", True),
+    ]
+    adjustments = dataframe_module.ProjectAdjustments(
+        {"Earlier": "Old", "Old": "Work"},
+        [],
+        {
+            "archive-b": {"targetId": "archive-b", "targetName": "Archive"},
+            "child": {"targetId": "archive-b", "targetName": "Archive"},
+        },
+    )
+    expected = {
+        "work": ("work", "Work"),
+        "child": ("archive-b", "Archive · archive-b"),
+        "leaf": ("archive-b", "Archive · archive-b"),
+        "active-archive": ("active-archive", "Archive · active-archive"),
+        "archive-a": ("archive-a", "Archive · archive-a"),
+        "archive-b": ("archive-b", "Archive · archive-b"),
+        "old": ("work", "Work"),
+        "earlier": ("work", "Work"),
+    }
+    report = _load_adjusted_activity(
+        monkeypatch, projects, tuple(expected), adjustments
+    )
+    assert {
+        row.parent_project_id: (row.root_project_id, row.root_project_name)
+        for row in report.itertuples()
+    } == expected
+
+    hierarchy = dataframe_module.resolve_project_hierarchy(
+        {spec.id: _project(spec) for spec in projects}, adjustments
+    )
+    assert hierarchy.parents["archive-b"] is None
+    assert hierarchy.parents["leaf"] == "child"
+    assert hierarchy.parents["child"] == "archive-b"
+    assert hierarchy.parents["earlier"] == "old"
+    assert {
+        project_id: (group.root_id, group.name)
+        for project_id, group in hierarchy.groups.items()
+    } == expected
+
+
+def test_cyclic_and_missing_project_links_leave_saved_rules_intact(tmp_path) -> None:
+    projects = {
+        spec.id: _project(spec)
+        for spec in [
+            ProjectSpec("one", "One", True),
+            ProjectSpec("two", "Two", True),
+            ProjectSpec("work", "Work", False),
+            ProjectSpec("first", "First", False, "work"),
+            ProjectSpec("second", "Second", False, "work"),
+            ProjectSpec("orphan", "Orphan", True, "unknown-parent"),
+        ]
+    }
+    original = dataframe_module.ProjectAdjustments(
+        {"One": "Two", "Two": "One"},
+        [],
+        {
+            "first": {"targetId": "second", "targetName": "Second"},
+            "second": {"targetId": "first", "targetName": "First"},
+            "orphan": {"targetId": "unavailable", "targetName": "Former group"},
+        },
+    )
+    path = tmp_path / "projects.py"
+    path.write_text(
+        dataframe_module.render_adjustments_file_content(*original), encoding="utf-8"
+    )
+    adjustments = dataframe_module.load_adjustments_file(path)
+    hierarchy = dataframe_module.resolve_project_hierarchy(projects, adjustments)
+
+    for project_id, group in hierarchy.groups.items():
+        assert hierarchy.parents[group.root_id] is None, project_id
+    assert (
+        hierarchy.groups["first"].root_id
+        == hierarchy.groups["second"].root_id
+        == "work"
+    )
+    assert hierarchy.groups["orphan"].root_id == "orphan"
+    assert adjustments == dataframe_module.load_adjustments_file(path) == original
+
+
+def test_load_project_adjustments_uses_env_personal_dir_and_safe_literals(
     monkeypatch, tmp_path
 ) -> None:
     personal_dir = tmp_path / "personal"
@@ -234,7 +348,7 @@ def test_get_adjusting_mapping_uses_env_personal_dir_and_safe_literals(
     )
     monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(personal_dir))
 
-    mapping = dataframe_module.get_adjusting_mapping()
+    mapping = dataframe_module.load_project_adjustments().mappings
 
     assert mapping == {
         'Archived "Research"': "Academy / North Wing",
@@ -242,7 +356,7 @@ def test_get_adjusting_mapping_uses_env_personal_dir_and_safe_literals(
     }
 
 
-def test_get_adjusting_mapping_rejects_non_literal_code(monkeypatch, tmp_path) -> None:
+def test_load_project_adjustments_rejects_non_literal_code(monkeypatch, tmp_path) -> None:
     personal_dir = tmp_path / "personal"
     personal_dir.mkdir()
     evil_file = personal_dir / "evil.py"
@@ -258,4 +372,4 @@ def test_get_adjusting_mapping_rejects_non_literal_code(monkeypatch, tmp_path) -
     monkeypatch.setenv("TODOIST_PERSONAL_DIR", str(personal_dir))
 
     with pytest.raises(ValueError, match="literal assignments"):
-        dataframe_module.get_adjusting_mapping("evil.py")
+        dataframe_module.load_project_adjustments("evil.py")

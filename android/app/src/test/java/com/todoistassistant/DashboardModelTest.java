@@ -6,7 +6,9 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -30,6 +32,31 @@ public class DashboardModelTest {
         .put("project_id", project)
         .put("content", name)
         .put("priority", priority);
+  }
+
+  private JSONObject completion(String project) throws Exception {
+    return new JSONObject()
+        .put("id", "event-" + project)
+        .put("object_id", "task-" + project)
+        .put("object_type", "item")
+        .put("event_type", "completed")
+        .put("event_date", "2026-11-01T10:00:00Z")
+        .put("parent_project_id", project);
+  }
+
+  private static String adjustedRootName(
+      String id,
+      Map<String, JSONObject> projects,
+      JSONObject mappings,
+      JSONObject projectMappings,
+      Set<String> promoted)
+      throws Exception {
+    JSONObject adjustments =
+        new JSONObject()
+            .put("mappings", mappings)
+            .put("projectMappings", projectMappings)
+            .put("archivedParents", new JSONArray(promoted));
+    return ProjectAdjustments.fromSnapshot(adjustments).resolver(projects).rootName(id);
   }
 
   @Test
@@ -637,6 +664,110 @@ public class DashboardModelTest {
   }
 
   @Test
+  public void activityReportsAndHierarchyAgreeOnPartialProjectMapping() throws Exception {
+    JSONObject work = new JSONObject().put("id", "work").put("name", "Work");
+    JSONObject child =
+        new JSONObject().put("id", "child").put("name", "Current").put("parent_id", "work");
+    JSONObject leaf =
+        new JSONObject().put("id", "leaf").put("name", "Leaf").put("parent_id", "child");
+    JSONObject activeArchive = new JSONObject().put("id", "active-archive").put("name", "Archive");
+    JSONArray active = new JSONArray().put(work).put(child).put(leaf).put(activeArchive);
+    JSONArray known =
+        new JSONArray()
+            .put(
+                new JSONObject()
+                    .put("id", "archive-a")
+                    .put("name", "Archive")
+                    .put("is_archived", true))
+            .put(
+                new JSONObject()
+                    .put("id", "archive-b")
+                    .put("name", "Archive")
+                    .put("is_archived", true)
+                    .put("parent_id", "work"))
+            .put(new JSONObject().put("id", "old").put("name", "Old").put("is_archived", true))
+            .put(
+                new JSONObject()
+                    .put("id", "earlier")
+                    .put("name", "Earlier")
+                    .put("is_archived", true));
+    JSONObject archiveB =
+        new JSONObject().put("targetId", "archive-b").put("targetName", "Archive");
+    JSONObject adjustments =
+        new JSONObject()
+            .put("mappings", new JSONObject().put("Earlier", "Old").put("Old", "Work"))
+            .put(
+                "projectMappings",
+                new JSONObject().put("archive-b", archiveB).put("child", archiveB));
+    Map<String, String> expected =
+        Map.of(
+            "work", "Work",
+            "child", "Archive · archive-b",
+            "leaf", "Archive · archive-b",
+            "active-archive", "Archive · active-archive",
+            "archive-a", "Archive · archive-a",
+            "archive-b", "Archive · archive-b",
+            "old", "Work",
+            "earlier", "Work");
+    JSONArray events = new JSONArray();
+    for (String id : expected.keySet()) events.put(completion(id));
+    DashboardModel model =
+        new DashboardModel(
+            empty()
+                .put("projects", active)
+                .put("knownProjects", known)
+                .put("activities", events)
+                .put("adjustments", adjustments),
+            CLOCK);
+    assertEquals(
+        Map.of(
+            "Work",
+            3,
+            "Archive · active-archive",
+            1,
+            "Archive · archive-a",
+            1,
+            "Archive · archive-b",
+            3),
+        model.weeklyProjects.get(8));
+    Map<String, String> roots = new HashMap<>();
+    JSONArray hierarchy = model.plotData.getJSONArray("hierarchy");
+    for (int i = 0; i < hierarchy.length(); i++) {
+      JSONObject row = hierarchy.getJSONObject(i);
+      roots.put(row.getString("id"), row.getString("rootName"));
+    }
+    assertEquals(expected, roots);
+  }
+
+  @Test
+  public void reportsAndHierarchyKeepLegacyGroupingWhenProjectMetadataIsMissing() throws Exception {
+    JSONObject work = new JSONObject().put("id", "work").put("name", "Work");
+    DashboardModel model =
+        new DashboardModel(
+            empty()
+                .put("projects", new JSONArray().put(work))
+                .put("activities", new JSONArray().put(completion("missing")))
+                .put(
+                    "adjustments",
+                    new JSONObject()
+                        .put("mappings", new JSONObject().put("Unknown project", "Work"))),
+            CLOCK);
+    assertEquals(Map.of("Work", 1), model.weeklyProjects.get(8));
+    JSONObject day = model.plotData.getJSONArray("dailyActivity").getJSONObject(0);
+    assertEquals(1, day.getJSONObject("projects").getInt("Work"));
+    JSONArray hierarchy = model.plotData.getJSONArray("hierarchy");
+    for (int i = 0; i < hierarchy.length(); i++) {
+      JSONObject row = hierarchy.getJSONObject(i);
+      if ("missing".equals(row.getString("id"))) {
+        assertFalse(row.getBoolean("metadataKnown"));
+        assertEquals("Work", row.getString("rootName"));
+        return;
+      }
+    }
+    fail("Activity with missing project metadata is missing from the timeline");
+  }
+
+  @Test
   public void historicalActivityCanUseKnownModernProjectId() throws Exception {
     JSONObject root = new JSONObject().put("id", "root").put("name", "Work");
     JSONObject child =
@@ -746,44 +877,39 @@ public class DashboardModelTest {
     JSONObject mappings = new JSONObject().put("Old", "Team").put("Promoted", "Work");
     assertEquals(
         "Promoted",
-        DashboardModel.rootName(
-            "child", projects, mappings, new JSONObject(), java.util.Set.of("Promoted")));
-    assertEquals(
-        "Work",
-        DashboardModel.rootName("child", projects, mappings, new JSONObject(), java.util.Set.of()));
+        adjustedRootName("child", projects, mappings, new JSONObject(), Set.of("Promoted")));
+    assertEquals("Work", adjustedRootName("child", projects, mappings, new JSONObject(), Set.of()));
     JSONObject another =
         new JSONObject().put("id", "other").put("name", "Team").put("parent_id", "another-root");
     projects.put("other", another);
-    assertEquals(
-        "Team",
-        DashboardModel.rootName("child", projects, mappings, new JSONObject(), java.util.Set.of()));
+    assertEquals("Team", adjustedRootName("child", projects, mappings, new JSONObject(), Set.of()));
     JSONObject one = new JSONObject().put("id", "one").put("name", "One").put("is_archived", true);
     JSONObject two = new JSONObject().put("id", "two").put("name", "Two").put("is_archived", true);
     assertEquals(
         "One",
-        DashboardModel.rootName(
+        adjustedRootName(
             "one",
             Map.of("one", one, "two", two),
             new JSONObject().put("One", "Two").put("Two", "One"),
             new JSONObject(),
-            java.util.Set.of()));
+            Set.of()));
     assertEquals(
         "One",
-        DashboardModel.rootName(
+        adjustedRootName(
             "one",
             Map.of("one", one),
             new JSONObject().put("One", "One"),
             new JSONObject(),
-            java.util.Set.of()));
+            Set.of()));
     one.put("parent_id", "root");
     assertEquals(
         "Work",
-        DashboardModel.rootName(
+        adjustedRootName(
             "one",
             Map.of("one", one, "root", root),
             new JSONObject().put("One", "One"),
             new JSONObject(),
-            java.util.Set.of()));
+            Set.of()));
   }
 
   @Test
@@ -816,33 +942,22 @@ public class DashboardModelTest {
                 new JSONObject().put("targetId", "second").put("targetName", "Duplicate"));
     JSONObject legacy = new JSONObject().put("Duplicate", "Wrong legacy root");
     assertEquals(
-        "Current root",
-        DashboardModel.rootName("first", projects, legacy, ids, java.util.Set.of("Duplicate")));
+        "Current root", adjustedRootName("first", projects, legacy, ids, Set.of("Duplicate")));
     assertEquals(
-        "Current root",
-        DashboardModel.rootName("child", projects, legacy, ids, java.util.Set.of("Duplicate")));
-    assertEquals(
-        "Duplicate · second",
-        DashboardModel.rootName("second", projects, legacy, ids, java.util.Set.of()));
+        "Current root", adjustedRootName("child", projects, legacy, ids, Set.of("Duplicate")));
+    assertEquals("Duplicate · second", adjustedRootName("second", projects, legacy, ids, Set.of()));
 
     ids.getJSONObject("first").put("targetId", "first");
-    assertEquals(
-        "Duplicate · first",
-        DashboardModel.rootName("first", projects, legacy, ids, java.util.Set.of()));
-    assertEquals(
-        "Duplicate · first",
-        DashboardModel.rootName("child", projects, legacy, ids, java.util.Set.of()));
+    assertEquals("Duplicate · first", adjustedRootName("first", projects, legacy, ids, Set.of()));
+    assertEquals("Duplicate · first", adjustedRootName("child", projects, legacy, ids, Set.of()));
 
     ids.getJSONObject("first").put("targetId", "missing");
     projects.put("other", new JSONObject().put("id", "other").put("name", "Old target name"));
     assertEquals(
-        "Old target name · missing",
-        DashboardModel.rootName("first", projects, legacy, ids, java.util.Set.of()));
+        "Old target name · missing", adjustedRootName("first", projects, legacy, ids, Set.of()));
     ids.getJSONObject("first").put("targetId", "second");
     ids.getJSONObject("second").put("targetId", "first");
-    assertEquals(
-        "Duplicate · first",
-        DashboardModel.rootName("first", projects, legacy, ids, java.util.Set.of()));
+    assertEquals("Duplicate · first", adjustedRootName("first", projects, legacy, ids, Set.of()));
   }
 
   @Test
@@ -866,18 +981,12 @@ public class DashboardModelTest {
             .put(
                 "parent",
                 new JSONObject().put("targetId", "mapped").put("targetName", "Mapped root"));
+    assertEquals("Legacy root", adjustedRootName("child", projects, names, ids, Set.of()));
+    assertEquals("Child", adjustedRootName("child", projects, names, ids, Set.of("Child")));
     assertEquals(
-        "Legacy root", DashboardModel.rootName("child", projects, names, ids, java.util.Set.of()));
-    assertEquals(
-        "Child", DashboardModel.rootName("child", projects, names, ids, java.util.Set.of("Child")));
-    assertEquals(
-        "Parent",
-        DashboardModel.rootName(
-            "child", projects, names, new JSONObject(), java.util.Set.of("Parent")));
+        "Parent", adjustedRootName("child", projects, names, new JSONObject(), Set.of("Parent")));
     ids.put("child", new JSONObject().put("targetId", "mapped").put("targetName", "Mapped root"));
-    assertEquals(
-        "Mapped root",
-        DashboardModel.rootName("child", projects, names, ids, java.util.Set.of("Child")));
+    assertEquals("Mapped root", adjustedRootName("child", projects, names, ids, Set.of("Child")));
   }
 
   @Test
@@ -908,7 +1017,10 @@ public class DashboardModelTest {
             .getString("targetName"));
     JSONObject incoming =
         ProjectAdjustments.parse(
-            "{\"format\":\"todoist-assistant-project-adjustments-v1\",\"mappings\":{},\"archivedParents\":[],\"projectMappings\":{\"one\":{\"targetId\":\"new-root\",\"targetName\":\"New root\"},\"two\":{\"targetId\":\"two\",\"targetName\":\"Own group\"}}}");
+            "{\"format\":\"todoist-assistant-project-adjustments-v1\","
+                + "\"mappings\":{},\"archivedParents\":[],\"projectMappings\":{"
+                + "\"one\":{\"targetId\":\"new-root\",\"targetName\":\"New root\"},"
+                + "\"two\":{\"targetId\":\"two\",\"targetName\":\"Own group\"}}}");
     JSONObject updated = ProjectAdjustments.merge(merged, incoming);
     incoming.getJSONObject("projectMappings").getJSONObject("one").put("targetName", "Mutated");
     assertEquals(

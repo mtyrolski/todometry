@@ -8,11 +8,16 @@ import androidx.lifecycle.AndroidViewModel;
 import androidx.lifecycle.LiveData;
 import androidx.lifecycle.MutableLiveData;
 import java.time.Clock;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import org.json.JSONObject;
 
 /** Owns IO and survives Activity recreation. No Activity or View is retained. */
@@ -525,13 +530,18 @@ public final class DashboardViewModel extends AndroidViewModel {
                     throw new java.io.IOException("File too large");
                   output.write(buffer, 0, count);
                 }
-                applyAdjustments(
-                    ProjectAdjustments.merge(
-                        snapshot.optJSONObject("adjustments"),
-                        ProjectAdjustments.parse(
-                            output.toString(java.nio.charset.StandardCharsets.UTF_8.name()))),
-                    request,
-                    "Project adjustments imported.");
+                DashboardModel updated =
+                    applyAdjustments(
+                        ProjectAdjustments.merge(
+                            snapshot.optJSONObject("adjustments"),
+                            ProjectAdjustments.parse(
+                                output.toString(java.nio.charset.StandardCharsets.UTF_8.name()))),
+                        request);
+                if (updated != null)
+                  post(
+                      request,
+                      new State(
+                          updated, false, false, false, true, "Project adjustments imported."));
               } catch (Exception exception) {
                 post(
                     request,
@@ -547,34 +557,65 @@ public final class DashboardViewModel extends AndroidViewModel {
             });
   }
 
-  void saveAdjustments(String text) {
+  void saveAdjustments(String text, Consumer<String> onComplete) {
     State current = state.getValue();
-    if (!canEditAdjustments(current)) return;
+    if (!canEditAdjustments(current)) {
+      onComplete.accept(
+          "Project adjustments are unavailable right now. Try again when the account is ready.");
+      return;
+    }
     int request = generation.incrementAndGet();
     state.setValue(
         new State(current.model, true, false, false, true, "Saving project adjustments…"));
-    task =
-        worker.submit(
+    String cancelled = "Could not save project adjustments. Try again.";
+    var save =
+        new FutureTask<DashboardModel>(
             () -> {
-              try {
-                if (text == null
-                    || text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 256 * 1024)
-                  throw new IllegalArgumentException("Invalid adjustments");
-                applyAdjustments(
-                    ProjectAdjustments.parse(text), request, "Project adjustments saved.");
-              } catch (Exception exception) {
-                post(
-                    request,
-                    new State(
-                        current.model,
-                        false,
-                        false,
-                        false,
-                        true,
+              if (text == null
+                  || text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 256 * 1024)
+                throw new IllegalArgumentException("Invalid adjustments");
+              return applyAdjustments(ProjectAdjustments.parse(text), request);
+            }) {
+          @Override
+          protected void done() {
+            main.post(
+                () -> {
+                  if (generation.get() != request) {
+                    onComplete.accept(cancelled);
+                    return;
+                  }
+                  DashboardModel updated = null;
+                  String error = cancelled;
+                  try {
+                    updated = get();
+                    if (updated != null) error = null;
+                  } catch (ExecutionException failure) {
+                    error =
                         "Could not save project adjustments. Check the project names and try"
-                            + " again."));
-              }
-            });
+                            + " again.";
+                  } catch (CancellationException ignored) {
+                    // A cancelled task can finish before its worker starts.
+                  } catch (InterruptedException interruption) {
+                    Thread.currentThread().interrupt();
+                  }
+                  state.setValue(
+                      new DashboardViewModel.State(
+                          updated == null ? current.model : updated,
+                          false,
+                          false,
+                          false,
+                          true,
+                          error == null ? "Project adjustments saved." : error));
+                  onComplete.accept(error);
+                });
+          }
+        };
+    task = save;
+    try {
+      worker.execute(save);
+    } catch (RejectedExecutionException unavailable) {
+      save.cancel(false);
+    }
   }
 
   private boolean canEditAdjustments(State current) {
@@ -587,18 +628,17 @@ public final class DashboardViewModel extends AndroidViewModel {
         && savedModel != null;
   }
 
-  private void applyAdjustments(JSONObject adjustments, int request, String message)
-      throws Exception {
+  private DashboardModel applyAdjustments(JSONObject adjustments, int request) throws Exception {
     JSONObject next = new JSONObject(snapshot.toString()).put("adjustments", adjustments);
     DashboardModel model = new DashboardModel(next, Clock.systemDefaultZone());
-    if (generation.get() != request || Thread.currentThread().isInterrupted()) return;
+    if (generation.get() != request || Thread.currentThread().isInterrupted()) return null;
     committing.set(true);
     try {
-      if (generation.get() != request) return;
+      if (generation.get() != request) return null;
       store.save(next, token);
       snapshot = next;
       savedModel = model;
-      post(request, new State(model, false, false, false, true, message));
+      return model;
     } finally {
       committing.set(false);
     }

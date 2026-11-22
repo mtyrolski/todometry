@@ -1,5 +1,6 @@
 """Check that removed product entry points stay unavailable."""
 
+from datetime import datetime, timezone
 from importlib.util import find_spec
 from pathlib import Path
 import re
@@ -25,7 +26,9 @@ def test_database_retains_activity_projects_and_labels_after_task_removal(tmp_pa
     database = Database(str(tmp_path / "missing.env"))
     assert database.list_labels() == []
     assert database.fetch_projects(include_tasks=False) == []
-    assert database.fetch_activity(max_pages=1) == []
+    assert database.fetch_activity_incremental(
+        set(), date_from=None, date_to=datetime(2024, 1, 8, tzinfo=timezone.utc)
+    ) == []
     assert operations == ["list_labels", "list_projects", "list_activity"]
 
 

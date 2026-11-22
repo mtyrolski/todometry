@@ -1,17 +1,22 @@
 """Tests for FastAPI runtime and status endpoints."""
 
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+from threading import Event
 from unittest.mock import MagicMock
 
 import pytest
 
 import todometry
 import todometry.web.api_components.runtime as runtime_component
-import todometry.web.api as web_api
-import todometry.web.routes.runtime_admin as runtime_admin
 import todometry.web.api_components.dashboard_runtime as dashboard_runtime_component
-from tests.unit.database.helpers import make_event
+from todometry.api import TodoistAPIClient, TodoistEndpoints
+from todometry.core.env import EnvVar
+from todometry.core.utils import Cache
+from todometry.database.base import Database
+from todometry.features import data_sync
+from tests.unit.database.helpers import event_payload, make_event
 from tests.web_api_helpers import _single_event_df
 
 # pylint: disable=protected-access
@@ -23,169 +28,352 @@ def _dashboard_log_dir(root: Path) -> Path:
     return dashboard_dir
 
 
-def _set_progress_state(**overrides) -> None:
-    defaults = {
-        "active": False,
-        "stage": None,
-        "step": 0,
-        "total_steps": 0,
-        "started_at": None,
-        "updated_at": None,
-        "detail": None,
-        "sub_current": None,
-        "sub_total": None,
-        "lanes": {},
-        "error": None,
+@pytest.fixture
+def activity_job(api_client, monkeypatch, tmp_path):
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "Europe/Warsaw")
+    monkeypatch.delenv(str(EnvVar.DASHBOARD_DEMO), raising=False)
+    monkeypatch.setenv("API_KEY", "test-token")
+    monkeypatch.setattr(
+        api_client.app.state, "dashboard_config_path", tmp_path / "dashboard.yaml"
+    )
+    return api_client.app.state.dashboard.sync
+
+
+def _wait_for_activity_job(api_client, activity_job) -> None:
+    async def wait():
+        assert activity_job.task is not None
+        await activity_job.task
+
+    assert api_client.portal is not None
+    api_client.portal.call(wait)
+
+
+def test_activity_sync_runs_in_background_and_publishes_verified_history(
+    monkeypatch, api_client, activity_job
+) -> None:
+    start = Event()
+    release = Event()
+    clock = datetime(2026, 11, 22, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(data_sync, "_now_utc", lambda: clock)
+    Cache().activity.save({make_event("saved", date=datetime(2026, 11, 19, 12))})
+    did_fail = False
+    calls = []
+    response_event = event_payload("fresh", event_date="2026-11-20T23:30:00Z")
+
+    def request_page(_client, spec, **_kwargs):
+        calls.append(spec.params)
+        start.set()
+        assert release.wait(timeout=5)
+        if did_fail:
+            raise ConnectionError("Todoist unavailable")
+        return {"results": [response_event], "next_cursor": None}
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", request_page)
+    month = "/api/activity/status?month=2026-11"
+    existing = api_client.get(month).json()
+    assert not calls
+    assert existing["firstEventDate"] == "2026-11-19"
+    assert existing["lastSyncedAt"] is None
+    assert existing["days"]["2026-11-19"]["coverage"] == "unverified"
+    assert existing["years"]["2026"] == {"coverage": "unverified", "eventCount": 1}
+    assert existing["months"]["2026-11"] == {"coverage": "unverified", "eventCount": 1}
+
+    try:
+        response = api_client.post("/api/activity/sync")
+        assert response.status_code == 202
+        assert start.wait(timeout=5)
+        status = response.json()["sync"]
+        assert status["state"] == "running"
+        assert api_client.post("/api/activity/sync").json()["sync"] == status
+        poll = api_client.get("/api/activity/status?sync_only=true")
+        assert poll.json() == {"demoMode": False, "sync": status}
+        assert api_client.get(month).json()["lastSyncedAt"] is None
+    finally:
+        release.set()
+
+    _wait_for_activity_job(api_client, activity_job)
+    completed = api_client.get(month).json()
+    assert len(calls) == 1
+    assert completed["sync"]["state"] == "succeeded"
+    assert completed["sync"]["newEvents"] == 1
+    assert completed["lastSyncedAt"] == clock.isoformat()
+    assert completed["timeZone"] == "Europe/Warsaw"
+    assert completed["latestEventDate"] == "2026-11-21"
+    assert completed["days"]["2026-11-21"] == {"coverage": "covered", "eventCount": 1}
+    assert completed["days"]["2026-11-20"] == {"coverage": "covered", "eventCount": 0}
+    assert completed["years"]["2026"] == {"coverage": "partial", "eventCount": 2}
+    assert completed["months"]["2026-11"] == {"coverage": "partial", "eventCount": 2}
+
+    clock += timedelta(hours=1)
+    did_fail = True
+    api_client.post("/api/activity/sync")
+    _wait_for_activity_job(api_client, activity_job)
+    failed = api_client.get(month).json()
+    assert failed["sync"]["state"] == "failed"
+    assert failed["sync"]["error"] == "Could not sync with Todoist. Try again."
+    assert failed["sync"]["startedAt"] > completed["sync"]["startedAt"]
+    assert failed["lastSyncedAt"] == completed["lastSyncedAt"]
+    assert failed["days"] == completed["days"]
+
+    clock += timedelta(days=1, microseconds=321000)
+    did_fail = False
+    response_event = event_payload("retried", event_date="2026-11-22T12:00:00Z")
+    assert api_client.post("/api/activity/sync").status_code == 202
+    _wait_for_activity_job(api_client, activity_job)
+    retried = api_client.get(month).json()
+    assert len(calls) == 3
+    assert calls[-1]["date_from"] == calls[-2]["date_from"]
+    assert retried["sync"]["state"] == "succeeded"
+    assert retried["sync"]["startedAt"] > failed["sync"]["startedAt"]
+    assert retried["sync"]["error"] is None
+    assert retried["sync"]["newEvents"] == 1
+    assert retried["lastSyncedAt"] == clock.isoformat()
+    assert retried["days"]["2026-11-22"] == {"coverage": "covered", "eventCount": 1}
+
+
+@pytest.mark.parametrize(
+    "recent_first", [False, True], ids=["full-first", "recent-first"]
+)
+def test_activity_and_dashboard_refresh_share_scan_with_separate_projection_result(
+    monkeypatch, api_client, activity_job, recent_first
+) -> None:
+    cache = Cache()
+    cache.activity.save(
+        {make_event("old"), make_event("saved", date=datetime(2026, 11, 19, 12))}
+    )
+    clock = datetime(2026, 11, 22, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(data_sync, "_now_utc", lambda: clock)
+    scan_started = Event()
+    release_scan = Event()
+    projection_started = Event()
+    release_projection = Event()
+    scans = []
+    changed_projects = []
+
+    def request_page(_client, spec, **_kwargs):
+        if spec.endpoint == TodoistEndpoints.LIST_LABELS:
+            return {"results": [], "next_cursor": None}
+        assert spec.endpoint == TodoistEndpoints.LIST_ACTIVITY
+        scans.append(spec.params)
+        scan_started.set()
+        assert release_scan.wait(timeout=5)
+        return {
+            "results": [event_payload("fresh", event_date="2026-11-20T23:30:00Z")],
+            "next_cursor": None,
+        }
+
+    def fetch_projects(database, _previous, changed):
+        changed_projects.append(changed)
+        database.projects_cache = []
+        return database.projects_cache
+
+    def fail_projection(_database, *, cache, hierarchy):
+        projection_started.set()
+        assert release_projection.wait(timeout=5)
+        raise ValueError("could not compute the dashboard view")
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", request_page)
+    monkeypatch.setattr(Database, "fetch_projects_incrementally", fetch_projects)
+    monkeypatch.setattr(Database, "fetch_archived_projects", lambda _database: [])
+    monkeypatch.setattr(
+        dashboard_runtime_component, "load_activity_data", fail_projection
+    )
+    month = "/api/activity/status?month=2026-11"
+    home = "/api/dashboard/home"
+    saved_home = f"{home}?cached_only=true"
+    progress = "/api/dashboard/progress"
+    assert api_client.get(saved_home).status_code == 200
+
+    try:
+        if recent_first:
+            started = api_client.post("/api/activity/sync").json()["sync"]
+            assert scan_started.wait(timeout=5)
+            assert api_client.get(home).json()["sync"]["state"] == "running"
+        else:
+            assert api_client.get(home).json()["sync"]["state"] == "running"
+            assert scan_started.wait(timeout=5)
+            started = api_client.post("/api/activity/sync").json()["sync"]
+
+        assert started["state"] == "running"
+        assert api_client.get(progress).json()["sync"] == started
+        assert api_client.get(month).json()["sync"] == started
+        assert api_client.get(month).json()["lastSyncedAt"] is None
+
+        release_scan.set()
+        assert projection_started.wait(timeout=5)
+        assert api_client.get(saved_home).status_code == 200
+        joined = api_client.post("/api/activity/sync").json()["sync"]
+        assert joined["startedAt"] == started["startedAt"]
+    finally:
+        release_scan.set()
+        release_projection.set()
+
+    _wait_for_activity_job(api_client, activity_job)
+    assert len(scans) == 1
+    assert len(changed_projects) == 1
+    assert "proj1" in changed_projects[0]
+    completed = api_client.get(month).json()
+    assert completed["sync"]["state"] == "succeeded"
+    assert completed["sync"]["newEvents"] == 1
+    assert completed["sync"]["error"] is None
+    assert completed["sync"]["dashboardError"]
+    assert completed["lastSyncedAt"] == clock.isoformat()
+    assert completed["days"]["2026-11-21"] == {"coverage": "covered", "eventCount": 1}
+    status = api_client.get(progress).json()
+    assert status["active"] is False
+    assert status["error"] == completed["sync"]["dashboardError"]
+    assert status["sync"] == completed["sync"]
+    saved = api_client.get(saved_home)
+    assert saved.status_code == 200
+    payload = saved.json()
+    assert payload["figures"]
+    assert payload["sync"] == completed["sync"]
+
+
+def test_activity_sync_does_not_join_a_different_connection(
+    monkeypatch, api_client, activity_job, tmp_path
+) -> None:
+    old_cache = Cache()
+    old_cache.activity.save({make_event("saved")})
+    first_page_started = Event()
+    release_first_page = Event()
+    requests = []
+
+    def request_page(client, spec, **_kwargs):
+        authorization = client._build_headers(spec.headers)["Authorization"]
+        if spec.endpoint == TodoistEndpoints.LIST_LABELS:
+            requests.append((authorization, "labels"))
+            return {"results": [], "next_cursor": None}
+        assert spec.endpoint == TodoistEndpoints.LIST_ACTIVITY
+        cursor = spec.params.get("cursor")
+        requests.append((authorization, cursor))
+        date = "2024-01-01T12:00:00Z"
+        if len(requests) == 1:
+            first_page_started.set()
+            assert release_first_page.wait(timeout=5)
+            return {
+                "results": [event_payload("first", event_date=date)],
+                "next_cursor": "next",
+            }
+        event_id = "second" if cursor else "other-source"
+        return {
+            "results": [event_payload(event_id, event_date=date)],
+            "next_cursor": None,
+        }
+
+    def fail_projection(*_args):
+        raise ConnectionError("projects unavailable after reading labels")
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", request_page)
+    monkeypatch.setattr(Database, "fetch_projects_incrementally", fail_projection)
+    home = "/api/dashboard/home"
+    assert api_client.get(f"{home}?cached_only=true").status_code == 200
+    try:
+        assert api_client.get(home).json()["sync"]["state"] == "running"
+        assert first_page_started.wait(timeout=5)
+        monkeypatch.setenv("API_KEY", "other-token")
+        assert api_client.post("/api/activity/sync").status_code == 409
+        monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path / "other"))
+        assert api_client.post("/api/activity/sync").status_code == 409
+        status = api_client.get("/api/activity/status?sync_only=true").json()["sync"]
+        assert status["state"] == "idle"
+    finally:
+        release_first_page.set()
+
+    _wait_for_activity_job(api_client, activity_job)
+    assert {event.id for event in old_cache.activity.load()} == {
+        "saved",
+        "first",
+        "second",
     }
-    defaults.update(overrides)
-    for name, value in defaults.items():
-        setattr(web_api._progress_state, name, value)
+    assert not Path(Cache().activity.path).exists()
+    assert api_client.post("/api/activity/sync").status_code == 202
+    _wait_for_activity_job(api_client, activity_job)
+    assert requests == [
+        ("Bearer test-token", None),
+        ("Bearer test-token", "next"),
+        ("Bearer test-token", "labels"),
+        ("Bearer other-token", None),
+    ]
+    assert {event.id for event in Cache().activity.load()} == {"other-source"}
 
 
-def test_runtime_logs_only_return_explicit_allowlist(
-    monkeypatch, tmp_path, api_client
+def test_activity_status_in_demo_hides_live_history_and_rejects_sync(
+    monkeypatch, api_client, activity_job
 ) -> None:
+    Cache().activity.save({make_event("saved")})
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "1")
+
+    history = api_client.get("/api/activity/status?month=2024-01").json()
+    assert history["demoMode"] is True
+    assert history["firstEventDate"] is None
+    assert history["lastSyncedAt"] is None
+    assert history["days"]["2024-01-01"]["eventCount"] == 0
+    assert api_client.post("/api/activity/sync").status_code == 409
+    assert activity_job.task is None
+    assert api_client.get("/api/activity/status?month=9999-12").status_code == 422
+
+
+@pytest.fixture
+def runtime_logs(monkeypatch, tmp_path):
     cache_dir = tmp_path / "cache"
     dashboard_dir = _dashboard_log_dir(cache_dir)
-    (dashboard_dir / "api.log").write_text("api line\n", encoding="utf-8")
-    (dashboard_dir / "frontend.log").write_text("frontend line\n", encoding="utf-8")
+    (dashboard_dir / "api.log").write_text("line-1\nline-2\nline-3\n", encoding="utf-8")
     (dashboard_dir / "rogue.log").write_text("rogue line\n", encoding="utf-8")
-
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(cache_dir))
-    monkeypatch.setattr(runtime_admin, "_resolve_data_dir", lambda: tmp_path / "data")
-
-    res = api_client.get("/api/runtime/logs")
-    assert res.status_code == 200
-    payload = res.json()
-
-    ids = [item["id"] for item in payload["sources"]]
-    assert ids == ["api", "frontend"]
-    assert "rogue" not in ids
-    assert all(item["inspectOnly"] is True for item in payload["sources"])
+    (dashboard_dir / "triton.log").write_text("legacy line\n", encoding="utf-8")
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(cache_dir))
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path / "data"))
 
 
-def test_runtime_log_read_accepts_allowlisted_source_only(
-    monkeypatch, tmp_path, api_client
-) -> None:
-    cache_dir = tmp_path / "cache"
-    dashboard_dir = _dashboard_log_dir(cache_dir)
-    (dashboard_dir / "api.log").write_text(
-        "line-1\nline-2\nline-3\n", encoding="utf-8"
-    )
-
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(cache_dir))
-    monkeypatch.setattr(runtime_admin, "_resolve_data_dir", lambda: tmp_path / "data")
-
-    client = api_client
-    ok = client.get("/api/runtime/logs/read?source=api&tail_lines=2&page=1")
-    assert ok.status_code == 200
-    payload = ok.json()
-    assert payload["source"] == "api"
+def test_runtime_logs_lists_only_allowlisted_sources(api_client, runtime_logs) -> None:
+    response = api_client.get("/api/runtime/logs")
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["inspectOnly"] is True
-    assert payload["content"] == "line-2\nline-3\n"
+    assert [item["id"] for item in payload["sources"]] == ["api", "frontend"]
+    api, frontend = payload["sources"]
+    assert api["available"] is True
+    assert api["path"] == "dashboard/api.log"
+    assert frontend["available"] is False
+    assert all(item["inspectOnly"] for item in payload["sources"])
 
-    missing = client.get("/api/runtime/logs/read?source=rogue")
-    assert missing.status_code == 404
 
-
-def test_admin_logs_lists_explicit_runtime_sources(
-    monkeypatch, tmp_path, api_client
-) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-
-    dashboard_dir = _dashboard_log_dir(tmp_path)
-    (dashboard_dir / "api.log").write_text("api ready\n", encoding="utf-8")
-    (tmp_path / "dashboard" / "unexpected.log").write_text(
-        "should not be listed\n", encoding="utf-8"
+def test_runtime_log_read_pages_an_allowlisted_source(api_client, runtime_logs) -> None:
+    response = api_client.get(
+        "/api/runtime/logs/read",
+        params={"source": "api", "tail_lines": 2, "page": 1},
     )
-
-    res = api_client.get("/api/admin/logs")
-    assert res.status_code == 200
-    payload = res.json()
-
-    assert [item["source"] for item in payload["logs"]] == ["api", "frontend"]
-    assert payload["logs"][0]["available"] is True
-    assert payload["logs"][0]["path"] == "dashboard/api.log"
-    assert all(item["path"] != "dashboard/unexpected.log" for item in payload["logs"])
-
-
-def test_admin_read_log_uses_named_runtime_source(
-    monkeypatch, tmp_path, api_client
-) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-
-    dashboard_dir = _dashboard_log_dir(tmp_path)
-    (dashboard_dir / "api.log").write_text("line-a\nline-b\n", encoding="utf-8")
-
-    client = api_client
-    res = client.get(
-        "/api/admin/logs/read",
-        params={"source": "api", "tail_lines": 20, "page": 1},
-    )
-    assert res.status_code == 200
-    payload = res.json()
-
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["source"] == "api"
     assert payload["label"] == "Backend API"
     assert payload["path"] == "dashboard/api.log"
-    assert "line-a" in payload["content"]
-    assert payload["totalLines"] == 2
-
-    missing = client.get("/api/admin/logs/read", params={"source": "frontend"})
-    assert missing.status_code == 404
-    assert "not available yet" in missing.json()["detail"]
-
-
-def test_runtime_logs_lists_curated_sources(
-    monkeypatch, tmp_path: Path, api_client
-) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(runtime_admin, "_resolve_data_dir", lambda: tmp_path)
-
-    dashboard_dir = _dashboard_log_dir(tmp_path)
-    (dashboard_dir / "api.log").write_text("api line\n", encoding="utf-8")
-
-    res = api_client.get("/api/runtime/logs")
-    assert res.status_code == 200
-    payload = res.json()
     assert payload["inspectOnly"] is True
-
-    by_id = {item["id"]: item for item in payload["sources"]}
-    assert by_id["api"]["available"] is True
-    assert by_id["api"]["inspectOnly"] is True
-    assert by_id["frontend"]["available"] is False
-    assert set(by_id) == {"api", "frontend"}
+    assert payload["content"] == "line-2\nline-3\n"
+    assert payload["totalLines"] == 3
 
 
-def test_runtime_read_log_rejects_removed_triton_source(
-    monkeypatch, tmp_path: Path, api_client
+@pytest.mark.parametrize(
+    ("source", "detail"),
+    [("rogue", "Unknown"), ("triton", "Unknown"), ("frontend", "not available yet")],
+)
+def test_runtime_log_read_rejects_unavailable_sources(
+    api_client, runtime_logs, source, detail
 ) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(runtime_admin, "_resolve_data_dir", lambda: tmp_path)
-
-    dashboard_dir = _dashboard_log_dir(tmp_path)
-    (dashboard_dir / "triton.log").write_text(
-        "line 1\nline 2\nline 3\n", encoding="utf-8"
-    )
-
-    res = api_client.get(
-        "/api/runtime/logs/read",
-        params={"source": "triton", "tail_lines": 2, "page": 1},
-    )
-    assert res.status_code == 404
+    response = api_client.get("/api/runtime/logs/read", params={"source": source})
+    assert response.status_code == 404
+    assert detail in response.json()["detail"]
 
 
 def test_admin_timezone_status_uses_system_timezone_when_not_configured(
     monkeypatch, tmp_path, api_client
 ) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv(str(web_api.EnvVar.TIMEZONE), raising=False)
-    monkeypatch.setattr(runtime_admin, "_detect_system_timezone", lambda: "UTC")
+    monkeypatch.delenv(str(EnvVar.TIMEZONE), raising=False)
     monkeypatch.setattr(runtime_component, "detect_system_timezone", lambda: "UTC")
 
     res = api_client.get("/api/admin/timezone")
@@ -200,9 +388,8 @@ def test_admin_timezone_status_uses_system_timezone_when_not_configured(
 
 
 def test_admin_timezone_set_and_clear(monkeypatch, tmp_path, api_client) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(runtime_admin, "_detect_system_timezone", lambda: "UTC")
     monkeypatch.setattr(runtime_component, "detect_system_timezone", lambda: "UTC")
 
     client = api_client
@@ -218,7 +405,7 @@ def test_admin_timezone_set_and_clear(monkeypatch, tmp_path, api_client) -> None
     assert set_payload["override"] == "Europe/Warsaw"
     assert set_payload["overrideValid"] is True
     assert set_payload["envPath"] == ".env"
-    assert web_api.os.getenv(str(web_api.EnvVar.TIMEZONE)) == "Europe/Warsaw"
+    assert os.getenv(str(EnvVar.TIMEZONE)) == "Europe/Warsaw"
 
     env_path = tmp_path / ".env"
     assert env_path.exists()
@@ -234,7 +421,7 @@ def test_admin_timezone_set_and_clear(monkeypatch, tmp_path, api_client) -> None
     assert clear_payload["source"] == "system"
     assert clear_payload["override"] is None
     assert clear_payload["envPath"] == ".env"
-    assert web_api.os.getenv(str(web_api.EnvVar.TIMEZONE)) is None
+    assert os.getenv(str(EnvVar.TIMEZONE)) is None
 
     env_text_after_clear = env_path.read_text(encoding="utf-8")
     assert "TODOIST_TIMEZONE" not in env_text_after_clear
@@ -243,9 +430,8 @@ def test_admin_timezone_set_and_clear(monkeypatch, tmp_path, api_client) -> None
 def test_admin_timezone_rejects_invalid_timezone(
     monkeypatch, tmp_path, api_client
 ) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(runtime_admin, "_detect_system_timezone", lambda: "UTC")
     monkeypatch.setattr(runtime_component, "detect_system_timezone", lambda: "UTC")
 
     response = api_client.post(
@@ -260,8 +446,7 @@ def test_admin_timezone_rejects_invalid_timezone(
 def test_admin_api_token_status_uses_safe_env_label(
     monkeypatch, tmp_path, api_client
 ) -> None:
-    env_path = tmp_path / ".env"
-    monkeypatch.setattr(runtime_admin, "_resolve_env_path", lambda: env_path)
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
     monkeypatch.setenv("API_KEY", "test_api_key_12345")
 
     res = api_client.get("/api/admin/api_token")
@@ -278,9 +463,11 @@ def test_admin_api_token_save_clear_and_status_cycle(
 ) -> None:
     env_path = tmp_path / ".env"
     token = "a" * 32
-    monkeypatch.setattr(runtime_admin, "_resolve_env_path", lambda: env_path)
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
     monkeypatch.delenv("API_KEY", raising=False)
-    monkeypatch.setattr(runtime_admin, "_validate_api_token", lambda _token: (True, None, 3))
+    monkeypatch.setattr(
+        runtime_component, "validate_api_token", lambda _token: (True, None, 3)
+    )
 
     client = api_client
 
@@ -313,70 +500,10 @@ def test_openapi_includes_app_version(api_client) -> None:
     res = api_client.get("/openapi.json")
     assert res.status_code == 200
     payload = res.json()
-    assert payload["info"]["version"] == web_api.app.version == todometry.__version__
+    assert payload["info"]["version"] == api_client.app.version == todometry.__version__
 
 
-@pytest.mark.parametrize(
-    ("state", "expected"),
-    [
-        (
-            {"updated_at": "2025-01-01T00:00:00"},
-            {
-                "active": False,
-                "stage": None,
-                "step": 0,
-                "totalSteps": 0,
-                "startedAt": None,
-                "error": None,
-            },
-        ),
-        (
-            {
-                "active": True,
-                "stage": "Loading data",
-                "step": 2,
-                "total_steps": 5,
-                "started_at": "2025-01-01T10:00:00",
-                "updated_at": "2025-01-01T10:00:30",
-                "detail": "Fetching projects",
-            },
-            {
-                "active": True,
-                "stage": "Loading data",
-                "step": 2,
-                "totalSteps": 5,
-                "startedAt": "2025-01-01T10:00:00",
-                "updatedAt": "2025-01-01T10:00:30",
-                "detail": "Fetching projects",
-                "error": None,
-            },
-        ),
-        (
-            {
-                "updated_at": "2025-01-01T10:05:00",
-                "error": "Failed to connect to API",
-            },
-            {
-                "active": False,
-                "error": "Failed to connect to API",
-                "updatedAt": "2025-01-01T10:05:00",
-            },
-        ),
-        (
-            {
-                "active": True,
-                "stage": "Processing",
-                "step": 1,
-                "total_steps": 3,
-                "started_at": "2025-01-01T12:00:00",
-                "updated_at": "2025-01-01T12:00:15",
-            },
-            {"active": True, "error": None, "stage": "Processing"},
-        ),
-    ],
-)
-def test_dashboard_progress_states(state, expected, api_client) -> None:
-    _set_progress_state(**state)
+def test_dashboard_progress_reports_idle_state(api_client, activity_job) -> None:
     res = api_client.get("/api/dashboard/progress")
     assert res.status_code == 200
     payload = res.json()
@@ -392,7 +519,33 @@ def test_dashboard_progress_states(state, expected, api_client) -> None:
         "lanes",
         "error",
     } <= set(payload)
-    assert {key: payload[key] for key in expected} == expected
+    assert payload["active"] is False
+    assert payload["stage"] is None
+    assert payload["step"] == payload["totalSteps"] == 0
+    assert payload["startedAt"] is None
+    assert payload["error"] is None
+    assert payload["sync"]["state"] == "idle"
+
+
+@pytest.fixture
+def progress_job(monkeypatch, api_client, activity_job):
+    started = Event()
+    release = Event()
+
+    def sync(_source):
+        started.set()
+        assert release.wait(timeout=5)
+        return data_sync.SyncResult(set(), set())
+
+    monkeypatch.setattr(runtime_component, "_sync_activity", sync)
+    try:
+        assert api_client.post("/api/activity/sync").status_code == 202
+        assert started.wait(timeout=5)
+        yield activity_job
+    finally:
+        release.set()
+        if activity_job.task is not None:
+            _wait_for_activity_job(api_client, activity_job)
 
 
 @pytest.mark.parametrize(
@@ -403,30 +556,31 @@ def test_dashboard_progress_states(state, expected, api_client) -> None:
     ],
 )
 def test_dashboard_progress_ignores_activity_page_counts(
-    stage, page_current, page_total, window_current, window_total, api_client
+    stage,
+    page_current,
+    page_total,
+    window_current,
+    window_total,
+    api_client,
+    progress_job,
 ) -> None:
-    _set_progress_state()
-    callback = web_api._build_tqdm_progress_callback()
+    callback = progress_job._build_tqdm_progress_callback()
+    path = "/api/dashboard/progress"
+    before = api_client.get(path).json()
     callback(stage, page_current, page_total, "page")
 
-    client = api_client
-    payload = client.get("/api/dashboard/progress").json()
-    assert payload["active"] is False
-    assert payload["subCurrent"] is None
-    assert payload["subTotal"] is None
-
+    assert api_client.get(path).json() == before
     callback(stage, window_current, window_total, "window")
 
-    payload = client.get("/api/dashboard/progress").json()
+    payload = api_client.get(path).json()
     assert payload["active"] is True
     assert payload["detail"] == f"{stage}: {window_current}/{window_total} window"
     assert payload["subCurrent"] == window_current
     assert payload["subTotal"] == window_total
 
 
-def test_dashboard_progress_uses_verbose_tqdm_detail(api_client) -> None:
-    _set_progress_state()
-    callback = web_api._build_tqdm_progress_callback()
+def test_dashboard_progress_uses_verbose_tqdm_detail(api_client, progress_job) -> None:
+    callback = progress_job._build_tqdm_progress_callback()
     callback(
         "Fetching activity history",
         1,
@@ -443,9 +597,10 @@ def test_dashboard_progress_uses_verbose_tqdm_detail(api_client) -> None:
     assert payload["subTotal"] == 3
 
 
-def test_dashboard_progress_reports_parallel_worker_lanes(api_client) -> None:
-    _set_progress_state()
-    callback = web_api._build_tqdm_progress_callback()
+def test_dashboard_progress_reports_parallel_worker_lanes(
+    api_client, progress_job
+) -> None:
+    callback = progress_job._build_tqdm_progress_callback()
     stage = "Fetching archived project activity"
     callback(stage, 0, 2, "project", f"{stage}: workers=2")
     callback(
@@ -500,7 +655,8 @@ def test_dashboard_progress_reports_parallel_worker_lanes(api_client) -> None:
 def test_archived_activity_scan_cache_skips_unchanged_projects_and_invalidates_safely(
     monkeypatch, tmp_path
 ) -> None:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
+    cache = Cache()
     target_holder = {
         "target": dashboard_runtime_component._ArchivedActivityTarget(
             project_id="archived-1",
@@ -513,26 +669,20 @@ def test_archived_activity_scan_cache_skips_unchanged_projects_and_invalidates_s
         "_configured_archived_parent_projects",
         lambda _dbio: {"archived-1": target_holder["target"]},
     )
-    monkeypatch.setattr(
-        dashboard_runtime_component,
-        "_set_progress_sync",
-        lambda *_args, **_kwargs: None,
-    )
+    state = dashboard_runtime_component.DashboardState()
     event = make_event("archived-event", parent_project_id="archived-1")
     dbio = MagicMock()
     dbio.fetch_activity_for_parent_projects.return_value = [event]
 
-    first = dashboard_runtime_component._fetch_configured_archived_parent_activity(
-        dbio, set()
+    dashboard_runtime_component._sync_configured_archived_parent_activity(
+        state, dbio, set(), cache=cache
     )
-    second = dashboard_runtime_component._fetch_configured_archived_parent_activity(
-        dbio, {event}
+    assert cache.activity.load() == {event}
+    dashboard_runtime_component._sync_configured_archived_parent_activity(
+        state, dbio, {event}, cache=cache
     )
-
-    assert first == {event}
-    assert second == set()
     assert dbio.fetch_activity_for_parent_projects.call_count == 1
-    saved_state = web_api.Cache().archived_activity_scans.load()
+    saved_state = cache.archived_activity_scans.load()
     assert saved_state["projects"]["archived-1"]["projectUpdatedAt"] == (
         "2026-01-01T00:00:00Z"
     )
@@ -542,12 +692,15 @@ def test_archived_activity_scan_cache_skips_unchanged_projects_and_invalidates_s
         label="Archived One",
         updated_at="2026-02-01T00:00:00Z",
     )
-    dashboard_runtime_component._fetch_configured_archived_parent_activity(
-        dbio, {event}
+    dashboard_runtime_component._sync_configured_archived_parent_activity(
+        state, dbio, {event}, cache=cache
     )
     assert dbio.fetch_activity_for_parent_projects.call_count == 2
 
-    dashboard_runtime_component._fetch_configured_archived_parent_activity(dbio, set())
+    cache.activity.save(set())
+    dashboard_runtime_component._sync_configured_archived_parent_activity(
+        state, dbio, set(), cache=cache
+    )
     assert dbio.fetch_activity_for_parent_projects.call_count == 3
 
 
@@ -560,75 +713,152 @@ def test_dashboard_status_excludes_triton_service(api_client) -> None:
 
 
 def _activity_cache_for_test(monkeypatch, tmp_path):
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
-    cache = web_api.Cache()
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv("API_KEY", "test-token")
+    cache = Cache()
     cache.activity.save(set())
     return cache
+
+
+def test_cancelled_cached_read_holds_lock_until_worker_finishes(monkeypatch, tmp_path):
+    import asyncio
+
+    runtime = dashboard_runtime_component
+    _activity_cache_for_test(monkeypatch, tmp_path)
+    state = runtime.DashboardState()
+    started = Event()
+    release = Event()
+
+    def slow_cache_load(state, *, source):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release cache load")
+        state.snapshot = runtime.DashboardSnapshot(
+            _single_event_df(), demo_mode=source.demo_mode, source_key=source.identity
+        )
+        return True
+
+    monkeypatch.setattr(runtime, "_load_saved_activity_state", slow_cache_load)
+    source = runtime_component.sync_source(demo_mode=False)
+
+    async def run():
+        request = asyncio.create_task(
+            runtime.ensure_state(state, refresh=False, cached_only=True, source=source)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            request.cancel()
+            await asyncio.sleep(0)
+            assert state.lock.locked()
+            assert not request.done()
+            next_read = asyncio.create_task(
+                runtime.ensure_state(
+                    state, refresh=False, cached_only=True, source=source
+                )
+            )
+            await asyncio.sleep(0)
+            assert not next_read.done()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await next_read
+        assert not state.lock.locked()
+        assert state.snapshot_for(source)
+
+    asyncio.run(run())
 
 
 def test_partial_background_refresh_keeps_reads_responsive_and_throttles_retries(
     monkeypatch, tmp_path
 ):
     import asyncio
-    import threading
     import time
-    import todometry.web.api_components.dashboard_runtime as runtime
+    from todometry.web.api_components import dashboard_runtime as runtime
 
     cache = _activity_cache_for_test(monkeypatch, tmp_path)
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.project_colors = {}
-    state.last_refresh_s = time.time() - 3600
-    state.activity_cache_signature = web_api._activity_cache_signature()
-    monkeypatch.setattr(web_api, "_state", state)
-    started = threading.Event()
-    release = threading.Event()
+    source = runtime_component.sync_source(demo_mode=False)
+    snapshot = runtime.DashboardSnapshot(
+        _single_event_df(),
+        last_refresh_s=time.time() - 3600,
+        source_key=source.identity,
+        activity_cache_signature=runtime._activity_cache_signature(cache),
+    )
+    state = runtime.DashboardState(snapshot=snapshot)
+    started = Event()
+    release = Event()
     attempts = []
 
-    def partial_failure(*, demo_mode):
-        attempts.append(demo_mode)
-        # The real sync persists activity before fetching projects. A later
-        # project failure must not invalidate the still usable snapshot.
-        cache.activity.save({"new-event"})
+    def sync(_source):
+        event = make_event(f"event-{len(attempts)}")
+        events = cache.activity.update(lambda existing: existing | {event})
+        return data_sync.SyncResult(events, {event})
+
+    def partial_failure(_state, *, source, result):
+        assert result is not None
+        attempts.append(source.demo_mode)
         started.set()
         if not release.wait(10):
             raise TimeoutError("test did not release refresh")
         raise ConnectionError("project fetch failed")
 
-    monkeypatch.setattr(web_api, "_refresh_state_sync", partial_failure)
+    monkeypatch.setattr(runtime_component, "_sync_activity", sync)
+    monkeypatch.setattr(runtime, "_refresh_state_sync", partial_failure)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        task = state.refresh_task
+        await runtime.ensure_state(state, refresh=False, source=source)
+        task = state.sync.task
         assert task is not None
         try:
             assert await asyncio.to_thread(started.wait, 5)
-            assert state.activity_cache_signature != web_api._activity_cache_signature()
+            assert (
+                snapshot.activity_cache_signature
+                != runtime._activity_cache_signature(cache)
+            )
             # Must return before the running refresh releases the state lock.
             await asyncio.wait_for(
-                runtime._ensure_state(refresh=False, demo_mode=False), timeout=2
+                runtime.ensure_state(state, refresh=False, source=source), timeout=2
             )
-            assert len(state.df_activity) == 1
+            assert state.snapshot is snapshot
         finally:
             release.set()
             await task
 
-        assert "saved data" in state.last_refresh_error
+        assert state.sync.status_for(source)["state"] == "succeeded"
+        assert state.sync.status_for(source)["dashboardError"]
         for _ in range(2):
-            await runtime._ensure_state(refresh=False, demo_mode=False)
+            await runtime.ensure_state(state, refresh=False, source=source)
         assert attempts == [False]
-        assert state.refresh_task is task
+        assert state.sync.task is task
+
+        # Explicit retries start during cooldown and survive a disconnected request.
+        started.clear()
+        release.clear()
+        request = asyncio.create_task(
+            runtime.ensure_state(state, refresh=True, source=source)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert state.sync.status_for(source)["state"] == "running"
+        finally:
+            release.set()
+            assert state.sync.task is not None
+            await state.sync.task
+        assert attempts == [False, False]
 
         # A later normal read schedules one retry, despite the changed signature.
-        state.last_refresh_attempt_s -= web_api._STATE_TTL_S + 1
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        retry = state.refresh_task
-        assert retry is not None and retry is not task
+        monkeypatch.setattr(runtime, "_STATE_TTL_S", 0.0)
+        previous_task = state.sync.task
+        await runtime.ensure_state(state, refresh=False, source=source)
+        retry = state.sync.task
+        assert retry is not None and retry is not previous_task
         await retry
-        assert attempts == [False, False]
+        assert attempts == [False, False, False]
 
     asyncio.run(run())
 
@@ -638,74 +868,42 @@ def test_changed_activity_cache_refreshes_fresh_snapshot_in_background(
 ):
     import asyncio
     import time
-    import todometry.web.api_components.dashboard_runtime as runtime
+    from todometry.web.api_components import dashboard_runtime as runtime
 
     cache = _activity_cache_for_test(monkeypatch, tmp_path)
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.project_colors = {}
-    state.last_refresh_s = time.time()
-    state.activity_cache_signature = web_api._activity_cache_signature()
-    cache.activity.save({"new-event"})
-    monkeypatch.setattr(web_api, "_state", state)
+    source = runtime_component.sync_source(demo_mode=False)
+    state = runtime.DashboardState(
+        snapshot=runtime.DashboardSnapshot(
+            _single_event_df(),
+            last_refresh_s=time.time(),
+            source_key=source.identity,
+            activity_cache_signature=runtime._activity_cache_signature(cache),
+        )
+    )
+    event = make_event("new-event")
+    cache.activity.save({event})
     attempts = []
 
-    def refresh(*, demo_mode):
-        attempts.append(demo_mode)
-        state.activity_cache_signature = web_api._activity_cache_signature()
+    def refresh(state, *, source, result):
+        assert result is not None and result.events == {event}
+        attempts.append(source.demo_mode)
+        state.snapshot.activity_cache_signature = runtime._activity_cache_signature(
+            cache
+        )
 
-    monkeypatch.setattr(web_api, "_refresh_state_sync", refresh)
+    monkeypatch.setattr(
+        runtime_component,
+        "_sync_activity",
+        lambda _source: data_sync.SyncResult({event}, set()),
+    )
+    monkeypatch.setattr(runtime, "_refresh_state_sync", refresh)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        task = state.refresh_task
+        await runtime.ensure_state(state, refresh=False, source=source)
+        task = state.sync.task
         assert task is not None
         await task
         assert attempts == [False]
-
-    asyncio.run(run())
-
-
-def test_partial_failure_throttles_normal_reads_but_allows_manual_retry(
-    monkeypatch, tmp_path
-):
-    import asyncio
-    import time
-    import todometry.web.api_components.dashboard_runtime as runtime
-
-    cache = _activity_cache_for_test(monkeypatch, tmp_path)
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.project_colors = {}
-    state.last_refresh_s = time.time() - 3600
-    state.activity_cache_signature = web_api._activity_cache_signature()
-    monkeypatch.setattr(web_api, "_state", state)
-    attempts = []
-
-    def partial_failure(*, demo_mode):
-        attempts.append(demo_mode)
-        cache.activity.save({"new-event"})
-        raise ConnectionError("project fetch failed")
-
-    monkeypatch.setattr(web_api, "_refresh_state_sync", partial_failure)
-
-    async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        assert state.refresh_task is not None
-        await state.refresh_task
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        assert attempts == [False]
-        assert "saved data" in state.last_refresh_error
-        # An explicit user refresh is deliberately not rate-limited.
-        await runtime._ensure_state(refresh=True, demo_mode=False)
-        assert attempts == [False, False]
 
     asyncio.run(run())
 
@@ -720,36 +918,22 @@ def test_partial_failure_throttles_normal_reads_but_allows_manual_retry(
         (True, [("token-a", "cache-a", False), ("token-a", "cache-a", True)], 2),
     ],
 )
-def test_history_backfill_attempt_survives_repeated_runtime_wrapper_calls(
+def test_history_backfill_attempt_is_retained_for_the_same_scope(
     monkeypatch, tmp_path, history_succeeds, contexts, expected_backfills
 ):
-    from types import SimpleNamespace
-
     _activity_cache_for_test(monkeypatch, tmp_path)
-    state = web_api._DashboardState()
-    monkeypatch.setattr(web_api, "_state", state)
-    token = ["token-a"]
-    monkeypatch.setattr(web_api, "_resolve_api_key", lambda: token[0])
-    monkeypatch.setattr(
-        web_api, "_run_async_in_main_loop", lambda coroutine: coroutine.close()
-    )
-    monkeypatch.setattr(web_api, "get_tqdm_progress_callback", lambda: None)
-    monkeypatch.setattr(web_api, "set_tqdm_progress_callback", lambda callback: None)
+    state = dashboard_runtime_component.DashboardState()
 
     class ProjectFetchFails:
-        def __init__(self, _path):
+        def __init__(self, _path, *, api_key):
             pass
 
         def fetch_projects_incrementally(self, _previous, _changed):
             raise ConnectionError("projects unavailable after history sync")
 
-    monkeypatch.setattr(web_api, "Database", ProjectFetchFails)
-    monkeypatch.setattr(dashboard_runtime_component, "load_activity_cache", lambda: set())
-    monkeypatch.setattr(dashboard_runtime_component, "needs_activity_history", lambda _: True)
+    monkeypatch.setattr(dashboard_runtime_component, "Database", ProjectFetchFails)
     monkeypatch.setattr(
-        dashboard_runtime_component,
-        "sync_recent_activity",
-        lambda _db: SimpleNamespace(new_events=set(), events=set()),
+        dashboard_runtime_component, "needs_activity_history", lambda _: True
     )
     backfills = []
 
@@ -757,12 +941,17 @@ def test_history_backfill_attempt_survives_repeated_runtime_wrapper_calls(
         backfills.append(True)
         if not history_succeeds:
             raise ConnectionError("history unavailable")
-        return SimpleNamespace(events=set())
+        return data_sync.SyncResult(set(), set())
 
-    monkeypatch.setattr(dashboard_runtime_component, "backfill_activity_history", backfill)
+    monkeypatch.setattr(
+        dashboard_runtime_component, "backfill_activity_history", backfill
+    )
     for current_token, cache_name, demo_mode in contexts:
-        token[0] = current_token
-        monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path / cache_name))
+        monkeypatch.setenv("API_KEY", current_token)
+        monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path / cache_name))
+        source = runtime_component.sync_source(demo_mode=demo_mode)
         with pytest.raises(ConnectionError, match="projects unavailable"):
-            web_api._call_dashboard_runtime("_refresh_state_sync", demo_mode=demo_mode)
+            dashboard_runtime_component._refresh_state_sync(
+                state, source=source, result=data_sync.SyncResult(set(), set())
+            )
     assert len(backfills) == expected_backfills

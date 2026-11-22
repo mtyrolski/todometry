@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 
+from todometry.core.runtime_env import runtime_env_lock
 from todometry.database.db_activity import DatabaseActivity
 from todometry.database.db_labels import DatabaseLabels
 from todometry.database.db_projects import DatabaseProjects
@@ -7,26 +8,12 @@ from todometry.core.utils import Anonymizable
 from loguru import logger
 
 
-class Database(Anonymizable, DatabaseActivity, DatabaseProjects, DatabaseLabels):
-    def __init__(self, dotenv_path: str):
-        load_dotenv(dotenv_path, override=True)
-        super().__init__()
-
-    def reset(self):
-        # Walk through MRO and invoke reset on each mixin that defines it
-        for cls in type(self).__mro__:
-            if cls in (Database, object, Anonymizable):
-                continue
-            reset_fn = getattr(cls, "reset", None)
-            if callable(reset_fn):
-                logger.debug(f"Resetting {cls.__name__}...")
-                # Call the bound method on self if it exists
-                try:
-                    reset_fn(self)  # type: ignore[misc]
-                except Exception as e:  # pragma: no cover - defensive
-                    logger.error(
-                        f"Reset failed for {cls.__name__}: {e.__class__.__name__}: {e}"
-                    )
+class Database(DatabaseActivity, DatabaseProjects, DatabaseLabels, Anonymizable):
+    def __init__(self, dotenv_path: str, *, api_key: str | None = None):
+        if api_key is None:
+            with runtime_env_lock:
+                load_dotenv(dotenv_path, override=True)
+        super().__init__(api_key=api_key)
 
     @property
     def anonimizable_subdatabases(self):

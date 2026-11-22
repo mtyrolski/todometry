@@ -110,7 +110,7 @@ test('calendar charts leave partial historical periods blank instead of implying
 
 test('project hierarchy excludes a historical week that is only partially refreshed', () => {
   const value = model({ activitySyncedAt: '2020-10-28T10:00:00Z' });
-  value.plotData.hierarchy = [{ id: 'work', name: 'Work', parentId: '', rootName: 'Work', color: 'blue', archived: false, createdAt: '2020-01-01', lastEventAt: '', archivedAt: '', weeklyCounts: { 6: 2, 7: 5 } }];
+  value.plotData.hierarchy = [{ id: 'work', name: 'Work', parentId: '', rootName: 'Work', archived: false, createdAt: '2020-01-01', archivedAt: '', weeklyCounts: { 6: 2, 7: 5 } }];
   const figure = hierarchyFigure(value, 0);
   assert.deepEqual(figure.data[0].values, [2]);
 });

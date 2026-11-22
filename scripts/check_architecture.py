@@ -1,30 +1,14 @@
-"""Report source size and prevent growth of known web architecture debt."""
+"""Report source size and check web architecture boundaries."""
 
 import ast
 import tokenize
 import tomllib
 from collections import Counter
+from importlib.util import resolve_name
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-# Temporary ceilings for code that predates this check. Reduce these as it is removed;
-# do not move or increase them to accommodate new injection.
-LEGACY = {
-    "todometry/web/api.py": {"sync": 1, "globals_subscript": 1},
-    "todometry/web/api_components/dashboard_runtime.py": {
-        "sync": 1,
-        "globals_subscript": 4,
-        "api_namespace": 1,
-    },
-    "todometry/web/routes/admin_settings.py": {"sync": 2},
-    "todometry/web/routes/common.py": {"sync": 1, "api_namespace": 1},
-    "todometry/web/routes/dashboard.py": {"sync": 6},
-}
-LEGACY_F821_PATHS = {
-    "todometry/web/api_components/*.py",
-    "todometry/web/routes/*.py",
-}
+API_MODULES = {"todometry.web.api", "todoist.web.api"}
 
 
 def _globals_call(node: ast.AST) -> bool:
@@ -37,38 +21,52 @@ def _globals_call(node: ast.AST) -> bool:
     )
 
 
-def inspect_python(path: Path) -> Counter[str]:
-    """Count the specific legacy injection mechanisms, ignoring comments and strings."""
+def inspect_python(path: Path, relative: Path) -> Counter[str]:
+    """Check imports back to the composition root and known injection mechanisms."""
     with path.open("rb") as stream:
         counts = Counter(
             {
                 "sync": sum(
-                    t.type == tokenize.NAME and t.string == "_sync_api_globals"
+                    t.type == tokenize.NAME
+                    and t.string in {"_sync_api_globals", "_call_dashboard_runtime"}
                     for t in tokenize.tokenize(stream.readline)
                 )
             }
         )
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    package = ".".join(relative.parent.parts)
+    nodes = list(ast.walk(tree))
     aliases = {"web_api"}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module in {
-            "todoist.web",
-            "todometry.web",
-        }:
-            aliases.update(a.asname or a.name for a in node.names if a.name == "api")
-        if isinstance(node, ast.Import):
-            aliases.update(
-                a.asname or a.name
-                for a in node.names
-                if a.name in {"todoist.web.api", "todometry.web.api"}
-            )
+    module_loaders = {"__import__", "importlib.import_module"}
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom):
+            module = resolve_name("." * node.level + (node.module or ""), package)
+            if module in API_MODULES and not (
+                relative.as_posix() == "todometry/launcher.py"
+                and module == "todometry.web.api"
+                and [item.name for item in node.names] == ["app"]
+            ):
+                counts["api_import"] += 1
+            for item in node.names:
+                if f"{module}.{item.name}" in API_MODULES:
+                    counts["api_import"] += 1
+                    aliases.add(item.asname or item.name)
+                if module == "importlib" and item.name == "import_module":
+                    module_loaders.add(item.asname or item.name)
+        elif isinstance(node, ast.Import):
+            for item in node.names:
+                if item.name in API_MODULES:
+                    counts["api_import"] += 1
+                    aliases.add(item.asname or item.name)
+                if item.name == "importlib" and item.asname:
+                    module_loaders.add(f"{item.asname}.import_module")
 
     def api_module(node: ast.AST) -> bool:
         return (
             isinstance(node, (ast.Name, ast.Attribute)) and ast.unparse(node) in aliases
         )
 
-    for node in ast.walk(tree):
+    for node in nodes:
         if isinstance(node, ast.Subscript) and _globals_call(node.value):
             counts["globals_subscript"] += 1
         if (
@@ -92,10 +90,24 @@ def inspect_python(path: Path) -> Counter[str]:
             and api_module(node.value)
         ):
             counts["api_namespace"] += 1
+        if (
+            isinstance(node, ast.Call)
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in API_MODULES
+            and ast.unparse(node.func) in module_loaders
+        ):
+            counts["api_import"] += 1
+    if relative.parts[1:2] == ("web",) and any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "__getattr__"
+        for node in tree.body
+    ):
+        counts["catch_all_export"] += 1
     return counts
 
 
-def check_ruff(config: dict, *, strict: bool = False) -> list[str]:
+def check_ruff(config: dict) -> list[str]:
     ruff = config.get("tool", {}).get("ruff", {})
     errors = []
     forbidden = {"F", "F821", "ALL"}
@@ -107,36 +119,31 @@ def check_ruff(config: dict, *, strict: bool = False) -> list[str]:
         for key in ("per-file-ignores", "extend-per-file-ignores"):
             for pattern, rules in section.get(key, {}).items():
                 for rule in forbidden.intersection(rules):
-                    if (
-                        strict
-                        or section_name != "ruff.lint"
-                        or key != "per-file-ignores"
-                        or pattern not in LEGACY_F821_PATHS
-                        or rule != "F821"
-                    ):
-                        errors.append(
-                            f"new Ruff undefined-name exemption: {pattern}: {rule}"
-                        )
+                    errors.append(f"Ruff undefined-name exemption: {pattern}: {rule}")
     return errors
 
 
-def check_tree(root: Path, *, strict: bool = False) -> list[str]:
+def check_tree(root: Path) -> list[str]:
     errors = []
     paths = [
         path
         for namespace in ("todoist", "todometry")
-        for path in (root / namespace / "web").rglob("*.py")
+        for path in (root / namespace).rglob("*.py*")
+        if path.suffix in {".py", ".pyi"} and path.is_file()
     ]
     for path in sorted(paths):
-        relative = path.relative_to(root).as_posix()
-        for kind, count in inspect_python(path).items():
-            allowed = 0 if strict else LEGACY.get(relative, {}).get(kind, 0)
-            if count > allowed:
+        relative = path.relative_to(root)
+        for kind, count in inspect_python(path, relative).items():
+            if kind == "api_import":
+                errors.append(f"import of API composition root in {relative}")
+            elif kind == "catch_all_export":
+                errors.append(f"catch-all web export in {relative}")
+            elif count:
                 errors.append(
-                    f"runtime namespace injection in {relative}: {kind}: {count} occurrences, allowed {allowed}"
+                    f"runtime namespace injection in {relative}: {kind}: {count} occurrences"
                 )
     with (root / "pyproject.toml").open("rb") as stream:
-        errors.extend(check_ruff(tomllib.load(stream), strict=strict))
+        errors.extend(check_ruff(tomllib.load(stream)))
     return errors
 
 
@@ -170,7 +177,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("Architecture check passed (existing injection debt is baselined).")
+    print("Architecture check passed.")
     return 0
 
 

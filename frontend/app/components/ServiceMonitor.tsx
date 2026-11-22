@@ -1,6 +1,5 @@
 "use client";
 
-import type { DashboardStatus } from "../lib/dashboardData";
 import { InfoTip } from "./InfoTip";
 
 export type ServiceStatus = {
@@ -23,11 +22,9 @@ function statusLabel(status: ServiceStatus["status"]): string {
 
 export function ServiceMonitor({
   services,
-  configurableItems,
   onRefresh
 }: {
   services: ServiceStatus[] | null;
-  configurableItems?: DashboardStatus["configurableItems"];
   onRefresh: () => void;
 }) {
   return (
@@ -45,11 +42,7 @@ export function ServiceMonitor({
         {!services ? (
           <div className="skeleton" style={{ minHeight: 140 }} />
         ) : (
-          services.map((svc) => {
-            const configurableItem = configurableItems?.find(
-              (item) => item.key.toLowerCase() === svc.name.toLowerCase() || svc.name.toLowerCase().includes(item.key.toLowerCase())
-            );
-            return (
+          services.map((svc) => (
             <div key={svc.name} className="row">
               <div className={`dot dot-${svc.status}`} />
               <div className="rowMain">
@@ -57,16 +50,10 @@ export function ServiceMonitor({
                 <p className="muted tiny">{statusLabel(svc.status)}</p>
               </div>
               <div className="adminRowRight">
-                {configurableItem?.anchor ? (
-                  <a className="button buttonSmall buttonGhost" href={`#${configurableItem.anchor}`}>
-                    🔧
-                  </a>
-                ) : null}
                 <pre className="rowDetail">{typeof svc.detail === "string" ? svc.detail : JSON.stringify(svc.detail)}</pre>
               </div>
             </div>
-          );
-          })
+          ))
         )}
       </div>
     </section>

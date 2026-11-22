@@ -2,10 +2,9 @@
 
 This doc captures the current build structure and the GitHub Actions workflows.
 
-**Release blocked:** web namespace injection and the remaining product and
-native upgrade validation are not complete. Publishing jobs require an explicit
-`publish` input on a tag and check identity and known web debt. See the
-[draft release notes](releases/v0.4.1.md).
+Publication still requires product and native upgrade validation. Publishing
+jobs require an explicit `publish` input on a tag and check identity and web
+architecture. See the [draft release notes](releases/v0.4.1.md).
 
 The Homebrew formula's source archive checksum must be verified and updated
 against the final release tag before distribution. CI uses a locally generated

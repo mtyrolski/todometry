@@ -64,6 +64,19 @@ def test_duplicate_event_ids_are_ignored_but_distinct_completions_remain():
     assert [e.id for e in reconcile_completions([b, a, a])] == ["1", "2"]
 
 
+def test_legacy_numeric_ids_match_text_ids_and_preserve_undo_order():
+    date = "2026-11-20T12:00:00"
+    legacy = event(11, "completed", date, task=81)
+    duplicate = event("11", "completed", date, task="81")
+    undo = event("12", "uncompleted", date, task="81")
+
+    assert len({legacy, duplicate, undo}) == 2
+    assert reconcile_completions([duplicate, legacy, undo]) == [undo]
+    frame = events_to_dataframe({legacy, undo}, {}, {})
+    assert frame["id"].tolist() == ["11", "12"]
+    assert frame[effective_completion_mask(frame)].empty
+
+
 def test_projection_does_not_modify_cache_objects():
     events = {
         event("1", "completed", "2026-10-01"),

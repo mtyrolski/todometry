@@ -33,6 +33,7 @@ _ACTIVITY_TYPES = list(_ACTIVITY_COLORS)
 _ACTIVITY_LABELS = {
     "completed": "Completion actions",
     "uncompleted": "Undone completions",
+    "other": "Other activity",
 }
 
 
@@ -70,17 +71,26 @@ def plot_events_over_time(
     _granularity: str,
     *,
     daily: bool = False,
+    include_other: bool = False,
 ) -> go.Figure:
     """Plot daily counts or a rolling average of events by activity type."""
 
     df_filtered = df.loc[(df.index >= beg_date) & (df.index < end_date)]
+    activity_types = _ACTIVITY_TYPES
+    if include_other:
+        known_types = df_filtered["type"].isin(_ACTIVITY_TYPES)
+        if not known_types.all():
+            df_filtered = df_filtered.assign(
+                type=df_filtered["type"].where(known_types, "other")
+            )
+            activity_types = [*_ACTIVITY_TYPES, "other"]
     last_day = (end_date - timedelta(microseconds=1)).date()
     date_range = pd.date_range(start=beg_date.date(), end=last_day, freq="D")
     daily_counts = (
         df_filtered.groupby([pd.Grouper(freq="D"), "type"])
         .size()
         .unstack(fill_value=0)
-        .reindex(index=date_range, columns=_ACTIVITY_TYPES, fill_value=0)
+        .reindex(index=date_range, columns=activity_types, fill_value=0)
     )
     values = (
         daily_counts
@@ -90,7 +100,7 @@ def plot_events_over_time(
     count_label = "Events: %{y}" if daily else "Average: %{y:.1f} events/day"
 
     fig = go.Figure()
-    for index, activity_type in enumerate(_ACTIVITY_TYPES):
+    for index, activity_type in enumerate(activity_types):
         if activity_type not in values.columns:
             continue
         label = _ACTIVITY_LABELS.get(activity_type, activity_type.capitalize())

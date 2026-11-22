@@ -5,7 +5,7 @@ type ProgressStep = {
   hint: string;
 };
 
-export type DashboardProgressLane = {
+type DashboardProgressLane = {
   id: string;
   label: string;
   detail: string;
@@ -47,37 +47,12 @@ const STEPS: ProgressStep[] = [
 
 const FALLBACK_TITLE = "Refreshing dashboard data";
 
-function resolveStepIndex(progress: DashboardProgress): number {
-  if (progress.step > 0) {
-    return Math.min(progress.step - 1, STEPS.length - 1);
-  }
-
-  if (progress.stage) {
-    const normalized = progress.stage.toLowerCase();
-    const idx = STEPS.findIndex((step) => step.label.toLowerCase() === normalized);
-    if (idx >= 0) return idx;
-    if (
-      normalized.includes("todoist") ||
-      normalized.includes("activity") ||
-      normalized.includes("project data") ||
-      normalized.includes("fetching")
-    ) {
-      return 0;
-    }
-    if (normalized.includes("hierarchy") || normalized.includes("root")) {
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
 export function ProgressSteps({ progress }: { progress: DashboardProgress | null }) {
   if (!progress?.active) return null;
 
-  const stepIndex = resolveStepIndex(progress);
   const totalSteps = STEPS.length;
-  const ratio = Math.min(1, (stepIndex + 1) / totalSteps);
+  const stepIndex = progress.step > 0 ? Math.min(progress.step - 1, totalSteps - 1) : 0;
+  const ratio = (stepIndex + 1) / totalSteps;
   const activeStep = STEPS[stepIndex];
   const stageLabel = progress.stage ?? activeStep?.label ?? "Working";
   const detail = progress.detail ?? activeStep?.hint ?? "";
@@ -107,7 +82,7 @@ export function ProgressSteps({ progress }: { progress: DashboardProgress | null
           {progress.error ? <p className="progressError">{progress.error}</p> : null}
         </div>
         <p className="progressMeta">
-          Step {Math.min(stepIndex + 1, totalSteps)} of {totalSteps}
+          Step {stepIndex + 1} of {totalSteps}
         </p>
       </div>
 

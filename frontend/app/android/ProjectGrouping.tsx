@@ -1,17 +1,126 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { command, normalizeSearch, type MobileModel } from "../lib/mobile";
+import type { MobilePlotData } from "../lib/mobilePlots";
+import { ProjectMappingSetup } from "../components/ProjectMappingSetup";
+import type { ProjectRule, ProjectRulePatch } from "../components/ProjectMappingSetup";
 
-/** Individual project rules coexist with legacy name-based desktop exports. */
-export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftChange }: {
+function saveAdjustments(mappings: Record<string, string>, archivedParents: string[], projectMappings: Record<string, ProjectRule>, requestId?: string) {
+  command("save-adjustments", JSON.stringify({
+    format: "todoist-assistant-project-adjustments-v1",
+    mappings,
+    archivedParents,
+    projectMappings,
+    requestId,
+  }));
+}
+
+function projectPath(project: MobilePlotData["hierarchy"][number], byId: Map<string, MobilePlotData["hierarchy"][number]>) {
+  const names = [project.name];
+  const seen = new Set([project.id]);
+  let parent = byId.get(project.parentId);
+  while (parent && !seen.has(parent.id)) {
+    names.unshift(parent.name);
+    seen.add(parent.id);
+    parent = byId.get(parent.parentId);
+  }
+  return names.join(" / ");
+}
+
+export function MobileProjectMappingSetup({ model, busy, onClose, firstRun = false, handleBack = true }: {
+  model: MobileModel;
+  busy: boolean;
+  onClose: () => void;
+  firstRun?: boolean;
+  handleBack?: boolean;
+}) {
+  const hierarchy = model.plotData?.hierarchy;
+  const projects = useMemo(() => {
+    const byId = new Map(hierarchy?.map((project) => [project.id, project]));
+    return [...byId.values()].filter((project) => project.metadataKnown !== false).map((project) => ({
+      id: project.id,
+      name: project.name,
+      path: projectPath(project, byId),
+      archived: project.archived,
+    }));
+  }, [hierarchy]);
+  const pending = useRef<{ id: string; resolve: () => void; reject: (cause: Error) => void } | null>(null);
+  useEffect(() => {
+    const finish = (event: Event) => {
+      const result = (event as CustomEvent<{ requestId: string; error: string | null }>).detail;
+      const save = pending.current;
+      if (!save || result?.requestId !== save.id) return;
+      pending.current = null;
+      if (result.error === null) save.resolve();
+      else save.reject(new Error(result.error || "Could not confirm project mapping was saved."));
+    };
+    window.addEventListener("todoist-adjustments-result", finish);
+    return () => {
+      window.removeEventListener("todoist-adjustments-result", finish);
+      pending.current?.reject(new Error("Project mapping setup was closed."));
+      pending.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    if (!handleBack) return;
+    const back = (event: Event) => {
+      event.stopImmediatePropagation();
+      if (!pending.current && !busy) onClose();
+    };
+    window.addEventListener("todoist-back", back, true);
+    return () => window.removeEventListener("todoist-back", back, true);
+  }, [busy, handleBack, onClose]);
+
+  const save = (patch: ProjectRulePatch) => new Promise<void>((resolve, reject) => {
+    if (!window.Todoist) {
+      reject(new Error("Could not connect to the Android app."));
+      return;
+    }
+    if (pending.current) {
+      reject(new Error("Project mapping is already being saved."));
+      return;
+    }
+    const rules = new Map(Object.entries(model.adjustments?.projectMappings ?? {}));
+    for (const [id, rule] of Object.entries(patch)) {
+      if (rule) rules.set(id, rule);
+      else rules.delete(id);
+    }
+    const id = `${Date.now()}-${Math.random()}`;
+    pending.current = { id, resolve, reject };
+    try {
+      saveAdjustments(model.adjustments?.mappings ?? {}, model.adjustments?.archivedParents ?? [], Object.fromEntries(rules), id);
+    } catch (error) {
+      pending.current = null;
+      reject(error);
+    }
+  });
+
+  return <ProjectMappingSetup projects={projects} rules={model.adjustments?.projectMappings ?? {}}
+    onSave={save} onClose={onClose} busy={busy} cancelLabel={firstRun ? "Skip setup" : "Cancel"} />;
+}
+
+type GroupingDraft = { search: string; source: string; target: string; customSource: string; customTarget: string; sourceId: string; targetId: string; targetSearch: string };
+type ProjectGroupingProps = {
   model: MobileModel | null;
   enabled: boolean;
   busy: boolean;
   message: string;
-  draft: { search: string; source: string; target: string; customSource: string; customTarget: string; sourceId: string; targetId: string; targetSearch: string };
-  onDraftChange: (draft: { search: string; source: string; target: string; customSource: string; customTarget: string; sourceId: string; targetId: string; targetSearch: string }) => void;
-}) {
+  draft: GroupingDraft;
+  onDraftChange: (draft: GroupingDraft) => void;
+};
+
+export function ProjectGrouping({ visible, ...props }: ProjectGroupingProps & { visible: boolean }) {
+  const [guided, setGuided] = useState(false);
+  if (guided && props.model) {
+    return <MobileProjectMappingSetup model={props.model} busy={!props.enabled || props.busy}
+      handleBack={visible} onClose={() => setGuided(false)} />;
+  }
+  return <ProjectGroupingForm {...props} openGuided={() => setGuided(true)} />;
+}
+
+/** Individual project rules coexist with legacy name-based desktop exports. */
+function ProjectGroupingForm({ model, enabled, busy, message, draft, onDraftChange, openGuided }: ProjectGroupingProps & { openGuided: () => void }) {
   const { search, source, target, customSource, customTarget, sourceId, targetId, targetSearch } = draft;
   const change = (value: Partial<typeof draft>) => onDraftChange({ ...draft, ...value });
   const adjustments = model?.adjustments;
@@ -19,6 +128,7 @@ export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftC
   const archivedParents = adjustments?.archivedParents ?? [];
   const projectMappings = adjustments?.projectMappings ?? {};
   const hierarchy = model?.plotData?.hierarchy ?? [];
+  const byId = new Map(hierarchy.map((project) => [project.id, project]));
   const savedMapping = (name: string) => Object.prototype.hasOwnProperty.call(mappings, name) ? mappings[name] : undefined;
   const savedProjectRule = (id: string) => Object.prototype.hasOwnProperty.call(projectMappings, id) ? projectMappings[id] : undefined;
   const sources = useMemo(() => [...new Set([
@@ -131,12 +241,7 @@ export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftC
   }, [source, sourceId, existing, target, draft, onDraftChange]);
 
   const save = (nextMappings: Record<string, string>, nextParents: string[], nextProjects = projectMappings) => {
-    command("save-adjustments", JSON.stringify({
-      format: "todoist-assistant-project-adjustments-v1",
-      mappings: nextMappings,
-      archivedParents: nextParents,
-      projectMappings: nextProjects,
-    }));
+    saveAdjustments(nextMappings, nextParents, nextProjects);
   };
   const assign = () => {
     if (!editable || invalidSourceId || invalidTargetId || activeChildOnly || !source || !target || (namedProjects.length > 1 && !sourceId) || (targetProjects.length > 1 && (!targetId || !sourceId)) || wouldCreateCycle) return;
@@ -170,18 +275,8 @@ export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftC
     save(next, archivedParents.filter((name) => name !== source));
   };
   const projectLabel = (project: typeof hierarchy[number]) => {
-    const names = [project.name];
-    const seen = new Set([project.id]);
-    let parentId = project.parentId;
-    while (parentId && !seen.has(parentId)) {
-      seen.add(parentId);
-      const parent = hierarchy.find((item) => item.id === parentId);
-      if (!parent) break;
-      names.unshift(parent.name);
-      parentId = parent.parentId;
-    }
     const former = project.previousNames?.length ? ` · formerly ${project.previousNames.join(", ")}` : "";
-    return `${names.join(" / ")} · ${project.archived ? "archived" : "active"} · ID ${project.id}${former}`;
+    return projectPath(project, byId) + " · " + (project.archived ? "archived" : "active") + " · ID " + project.id + former;
   };
   const chooseSource = (name: string, nameRule = false, resetSearch = false) => {
     const matches = hierarchy.filter((project) => project.name === name);
@@ -192,7 +287,10 @@ export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftC
 
   return (
     <section className="card" aria-label="Project grouping">
-      <header className="cardHeader"><h2>Project grouping</h2></header>
+      <header className="cardHeader">
+        <h2>Project grouping</h2>
+        {enabled && <button className="button buttonSmall" type="button" disabled={!editable || !hierarchy.length} onClick={openGuided}>Guided setup</button>}
+      </header>
       <p className="muted tiny">Todoist does not always retain the parent of an archived project. When a parent is missing or incorrect, choose a project to group it under.</p>
       {!enabled ? <p className="muted tiny">Connect your account to edit or import groupings.</p> : (
         <>
@@ -228,7 +326,7 @@ export function ProjectGrouping({ model, enabled, busy, message, draft, onDraftC
               </label>}
               {invalidSourceId && <p className="pill pill-warn">The selected project ID is no longer in the synced projects. Select a project again before changing its grouping.</p>}
               {!sourceKnown && <p className="muted tiny">This saved project name is not in the current project list. Its rule is preserved.</p>}
-              {activeChildOnly && <p className="pill pill-warn">This active subproject follows its Todoist parent. It can be assigned here after archiving.</p>}
+              {activeChildOnly && <p className="pill pill-warn">This active subproject follows its Todoist parent by default. Guided setup can assign it by ID.</p>}
               {activeOnly && !activeChildOnly && <p className="muted tiny">This active root can be assigned to another group; only archived projects can be marked as their own group.</p>}
               {mixedStatus && <p className="pill pill-warn">Active subprojects follow their Todoist parents. A rule for this name may apply differently to active and archived projects.</p>}
               <p className="muted tiny">Current grouping: {currentGrouping}</p>

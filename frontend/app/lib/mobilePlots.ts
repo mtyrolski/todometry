@@ -18,17 +18,13 @@ export type MobilePlotData = {
     name: string;
     parentId: string;
     rootName: string;
-    color: string;
     archived: boolean;
     previousNames?: string[];
     metadataKnown?: boolean;
     createdAt: string;
-    lastEventAt: string;
-    updatedAt?: string;
     createdAtSource?: "metadata" | "activity" | "unknown";
     archivedAt: string;
     weeklyCounts: Record<string, number>;
-    openTasks?: number;
     dailyCompletions?: { date: string; count: number }[];
     dailyEvents?: { date: string; count: number }[];
   }[];

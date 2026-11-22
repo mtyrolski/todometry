@@ -18,14 +18,14 @@ if TYPE_CHECKING:
 
 def completion_projection(events: Iterable["Event"]) -> tuple[list["Event"], set[str]]:
     ordered = sorted(
-        {event.id: event for event in events}.values(),
+        {str(event.id): event for event in events}.values(),
         key=lambda event: (
             (
                 event.date
                 if event.date.tzinfo
                 else event.date.replace(tzinfo=timezone.utc)
             ).timestamp(),
-            event.id,
+            str(event.id),
         ),
     )
     recurring: dict[str, bool] = {}
@@ -35,6 +35,7 @@ def completion_projection(events: Iterable["Event"]) -> tuple[list["Event"], set
         entry = event.event_entry
         if entry.object_type != "item":
             continue
+        task_id = str(entry.object_id)
         extra = entry.extra_data or {}
         due = extra.get("due")
         declared = extra.get("is_recurring")
@@ -43,15 +44,15 @@ def completion_projection(events: Iterable["Event"]) -> tuple[list["Event"], set
         if not isinstance(declared, bool) and extra.get("sub_tasks_reset") is True:
             declared = True
         if isinstance(declared, bool):
-            if recurring.get(entry.object_id, False) != declared:
-                outstanding.pop(entry.object_id, None)
-            recurring[entry.object_id] = declared
-        if recurring.get(entry.object_id, False):
+            if recurring.get(task_id, False) != declared:
+                outstanding.pop(task_id, None)
+            recurring[task_id] = declared
+        if recurring.get(task_id, False):
             continue
         if entry.event_type == "completed":
-            outstanding.setdefault(entry.object_id, []).append(event.id)
+            outstanding.setdefault(task_id, []).append(str(event.id))
         elif entry.event_type == "uncompleted":
-            pending = outstanding.get(entry.object_id, [])
+            pending = outstanding.get(task_id, [])
             if pending:
                 cancelled.add(pending.pop())
     return ordered, cancelled
@@ -59,7 +60,7 @@ def completion_projection(events: Iterable["Event"]) -> tuple[list["Event"], set
 
 def reconcile_completions(events: Iterable["Event"]) -> list["Event"]:
     ordered, cancelled = completion_projection(events)
-    return [event for event in ordered if event.id not in cancelled]
+    return [event for event in ordered if str(event.id) not in cancelled]
 
 
 def effective_completion_mask(frame: DataFrame, type_column: str = "type") -> Series:

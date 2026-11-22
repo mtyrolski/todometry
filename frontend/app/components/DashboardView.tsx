@@ -22,11 +22,12 @@ import {
   PLOT_HELP,
   SPOTLIGHT_HELP
 } from "../lib/dashboardCopy";
-import type { DashboardHome } from "../lib/dashboardData";
+import type { DashboardHome, HistoryCharts, HistoryRange } from "../lib/dashboardData";
 import {
   useApiHealth,
   useDashboardHome,
   useDashboardStatus,
+  useHistoryCharts,
   useSyncLabel
 } from "../lib/dashboardHooks";
 
@@ -58,6 +59,12 @@ type DashboardHomeWithUrgency = DashboardHome & {
 };
 
 type HierarchyFrame = { date: string; figure: PlotlyFigure };
+type HierarchyDashboard = Pick<DashboardHome | HistoryCharts, "figures" | "range" | "refreshedAt">;
+type HierarchyPlayback = { revision: string } & (
+  | { phase: "loading" }
+  | { phase: "failed"; error: string }
+  | { phase: "ready"; frames: HierarchyFrame[]; frameIndex: number; playing: boolean }
+);
 
 function buildHierarchyFigureLayout(figure: PlotlyFigure): Record<string, unknown> {
   const { title: _title, height: _height, ...baseLayout } = figure.layout ?? {};
@@ -116,71 +123,87 @@ function buildHierarchyFigureLayout(figure: PlotlyFigure): Record<string, unknow
   };
 }
 
-function HierarchyCard({ dashboard, height }: { dashboard: DashboardHome | null; height?: number }) {
-  const [hierarchyFrames, setHierarchyFrames] = useState<HierarchyFrame[]>([]);
-  const [hierarchyFrameIndex, setHierarchyFrameIndex] = useState(-1);
-  const [hierarchyPlaying, setHierarchyPlaying] = useState(false);
-  const [hierarchyLoading, setHierarchyLoading] = useState(false);
-  const [hierarchyError, setHierarchyError] = useState<string | null>(null);
-  const hierarchyRequest = useRef<AbortController | null>(null);
-  const activeProjectHierarchyFigure = dashboard?.figures.activeProjectHierarchy ?? null;
-  const hierarchyRangeKey = `${dashboard?.range.mode ?? ""}:${dashboard?.range.weeks ?? ""}:${dashboard?.range.beg ?? ""}:${dashboard?.range.end ?? ""}:${dashboard?.refreshedAt ?? ""}`;
-  useEffect(() => {
-    setHierarchyFrames([]);
-    setHierarchyFrameIndex(-1);
-    setHierarchyPlaying(false);
-    setHierarchyLoading(false);
-    setHierarchyError(null);
-    return () => hierarchyRequest.current?.abort();
-  }, [hierarchyRangeKey]);
+function HierarchyCard({ dashboard, height }: { dashboard: HierarchyDashboard | null; height?: number }) {
+  const range = dashboard?.range;
+  const beg = range?.beg;
+  const end = range?.end;
+  const weeks = range?.mode === "rolling" ? range.weeks : undefined;
+  const revision = range ? `${weeks ?? "custom"}:${beg}:${end}:${dashboard?.refreshedAt}` : null;
+  const figure = dashboard?.figures.activeProjectHierarchy;
+  const [playback, setPlayback] = useState<HierarchyPlayback | null>(null);
+  const currentPlayback = playback?.revision === revision ? playback : null;
+  if (playback !== currentPlayback) setPlayback(null);
+  const ready = currentPlayback?.phase === "ready" ? currentPlayback : null;
+  const frame = ready?.frames[ready.frameIndex];
+  const playing = ready?.playing ?? false;
+  const loading = currentPlayback?.phase === "loading";
+  const displayedFigure = frame?.figure ?? figure;
 
   useEffect(() => {
-    if (!hierarchyPlaying || !hierarchyFrames.length) return;
-    if (hierarchyFrameIndex >= hierarchyFrames.length - 1) {
-      setHierarchyPlaying(false);
-      return;
-    }
-    const timer = window.setTimeout(() => setHierarchyFrameIndex(hierarchyFrameIndex + 1), 700);
-    return () => window.clearTimeout(timer);
-  }, [hierarchyPlaying, hierarchyFrames, hierarchyFrameIndex]);
-
-  const startHierarchyPlayback = async () => {
-    if (!dashboard) return;
-    if (hierarchyFrames.length) {
-      if (hierarchyFrameIndex < 0 || hierarchyFrameIndex >= hierarchyFrames.length - 1) {
-        setHierarchyFrameIndex(0);
-      }
-      setHierarchyPlaying(true);
-      return;
-    }
+    if (currentPlayback?.phase !== "loading" || !beg || !end) return;
     const controller = new AbortController();
-    hierarchyRequest.current = controller;
-    setHierarchyLoading(true);
-    setHierarchyError(null);
-    try {
-      const params = dashboard.range.mode === "custom"
-        ? new URLSearchParams({ beg: dashboard.range.beg, end: dashboard.range.end })
-        : new URLSearchParams({ weeks: String(dashboard.range.weeks) });
-      params.set("cached_only", "true");
-      const response = await fetch(`/api/dashboard/hierarchy-playback?${params}`, { signal: controller.signal });
-      if (!response.ok) throw new Error(`Playback request failed (${response.status})`);
-      const payload = await response.json() as { frames?: HierarchyFrame[]; error?: string };
-      if (payload.error) throw new Error(payload.error);
-      if (!payload.frames?.length) throw new Error("No hierarchy snapshots available");
-      if (controller.signal.aborted) return;
-      setHierarchyFrames(payload.frames);
-      setHierarchyFrameIndex(0);
-      setHierarchyPlaying(true);
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        setHierarchyError(error instanceof Error ? error.message : "Playback unavailable");
+    const params = new URLSearchParams(weeks === undefined ? { beg, end } : { weeks: String(weeks) });
+    params.set("cached_only", "true");
+
+    const load = async () => {
+      const { revision } = currentPlayback;
+      let result: HierarchyPlayback;
+      try {
+        const response = await fetch(`/api/dashboard/hierarchy-playback?${params}`, { signal: controller.signal });
+        if (!response.ok) throw new Error(`Playback request failed (${response.status})`);
+        const payload = await response.json() as { frames?: HierarchyFrame[]; error?: string };
+        if (payload.error) throw new Error(payload.error);
+        if (!payload.frames?.length) throw new Error("No hierarchy snapshots available");
+        result = {
+          revision, phase: "ready", frames: payload.frames, frameIndex: 0, playing: payload.frames.length > 1
+        };
+      } catch (error) {
+        result = { revision, phase: "failed", error: error instanceof Error ? error.message : "Playback unavailable" };
       }
-    } finally {
-      if (!controller.signal.aborted) setHierarchyLoading(false);
-    }
+      if (!controller.signal.aborted) {
+        setPlayback((current) => current === currentPlayback ? result : current);
+      }
+    };
+    void load();
+    return () => controller.abort();
+  }, [beg, end, weeks, currentPlayback]);
+
+  useEffect(() => {
+    if (!ready?.playing) return;
+    const frameIndex = ready.frameIndex + 1;
+    const timer = window.setTimeout(() => {
+      setPlayback((current) => current === ready
+        ? { ...ready, frameIndex, playing: frameIndex < ready.frames.length - 1 }
+        : current);
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [ready]);
+
+  const stopPlayback = (frameIndex?: number) => {
+    setPlayback((current) => current?.phase === "ready" && current.revision === revision
+      ? { ...current, playing: false, frameIndex: frameIndex ?? current.frameIndex }
+      : current);
   };
-  const hierarchyFrame = hierarchyFrameIndex >= 0 ? hierarchyFrames[hierarchyFrameIndex] : null;
-  const displayedHierarchyFigure = hierarchyFrame?.figure ?? activeProjectHierarchyFigure;
+
+  const startHierarchyPlayback = () => {
+    if (revision === null) return;
+    setPlayback((current) => {
+      if (current?.revision === revision) {
+        if (current.phase === "loading") return current;
+        if (current.phase === "ready") {
+          const { frames, frameIndex } = current;
+          const restart = frameIndex < 0 || frameIndex >= frames.length - 1;
+          return { ...current, frameIndex: restart ? 0 : frameIndex, playing: frames.length > 1 };
+        }
+      }
+      return { revision, phase: "loading" };
+    });
+  };
+  let playLabel = "Play history";
+  if (loading) playLabel = "Preparing…";
+  else if (ready && frame) {
+    playLabel = ready.frameIndex < ready.frames.length - 1 ? "Resume" : "Replay";
+  }
   return (
     <section className="card cardFillHeight hierarchyCard">
       <header className="cardHeader hierarchyCardHeader">
@@ -190,43 +213,43 @@ function HierarchyCard({ dashboard, height }: { dashboard: DashboardHome | null;
             <InfoTip label="About project hierarchy" content={PLOT_HELP.activeProjectHierarchy} />
           </div>
           <div className="hierarchyPlaybackControls">
-            {hierarchyFrame ? <span className="muted tiny">Through {hierarchyFrame.date}</span> : null}
-            {hierarchyPlaying ? (
-              <button className="button buttonSmall" type="button" onClick={() => setHierarchyPlaying(false)}>Pause</button>
+            {frame ? <span className="muted tiny">Through {frame.date}</span> : null}
+            {playing ? (
+              <button className="button buttonSmall" type="button" onClick={() => stopPlayback()}>Pause</button>
             ) : (
-              <button className="button buttonSmall" type="button" onClick={startHierarchyPlayback} disabled={hierarchyLoading || !activeProjectHierarchyFigure}>
-                {hierarchyLoading ? "Preparing…" : hierarchyFrameIndex >= 0 && hierarchyFrameIndex < hierarchyFrames.length - 1 ? "Resume" : hierarchyFrameIndex >= 0 ? "Replay" : "Play history"}
+              <button className="button buttonSmall" type="button" onClick={startHierarchyPlayback} disabled={loading || !figure}>
+                {playLabel}
               </button>
             )}
-            {hierarchyFrame ? (
-              <button className="button buttonSmall buttonGhost" type="button" onClick={() => { setHierarchyPlaying(false); setHierarchyFrameIndex(-1); }}>Current</button>
+            {frame ? (
+              <button className="button buttonSmall buttonGhost" type="button" onClick={() => stopPlayback(-1)}>Current</button>
             ) : null}
           </div>
         </div>
-        {hierarchyFrames.length > 1 ? (
+        {ready && ready.frames.length > 1 ? (
           <input
             className="hierarchyPlaybackSlider"
             type="range"
             min={0}
-            max={hierarchyFrames.length - 1}
-            value={Math.max(0, hierarchyFrameIndex)}
+            max={ready.frames.length - 1}
+            value={Math.max(0, ready.frameIndex)}
             aria-label="Hierarchy playback date"
-            onChange={(event) => { setHierarchyPlaying(false); setHierarchyFrameIndex(Number(event.target.value)); }}
+            onChange={(event) => stopPlayback(Number(event.target.value))}
           />
         ) : null}
-        {hierarchyError ? <p className="muted tiny" role="alert">{hierarchyError}</p> : null}
+        {currentPlayback?.phase === "failed" && <p className="muted tiny" role="alert">{currentPlayback.error}</p>}
         <p className="muted hierarchyCardLead">
           Sunburst view of completed tasks across active and archived projects, assigned to their effective parent.
         </p>
       </header>
       <div className="cardBody cardBodyFill hierarchyCardBody">
         <div className="hierarchyPlotStage" style={{ minHeight: height }}>
-          {!displayedHierarchyFigure ? (
+          {!displayedFigure ? (
             <div className="skeleton hierarchyPlotSkeleton" />
           ) : (
             <Plot
-              data={displayedHierarchyFigure.data as PlotParams["data"]}
-              layout={{ ...buildHierarchyFigureLayout(displayedHierarchyFigure), transition: { duration: hierarchyPlaying ? 550 : 0, easing: "cubic-in-out" } }}
+              data={displayedFigure.data as PlotParams["data"]}
+              layout={{ ...buildHierarchyFigureLayout(displayedFigure), transition: { duration: playing ? 550 : 0, easing: "cubic-in-out" } }}
               config={{
                 displayModeBar: true,
                 responsive: true,
@@ -243,9 +266,12 @@ function HierarchyCard({ dashboard, height }: { dashboard: DashboardHome | null;
   );
 }
 
-export function HistoryDashboard({ range }: { range: { beg: string; end: string } }) {
-  const { dashboard, loadingDashboard, dashboardError } = useDashboardHome({ historyRange: range });
-  const figures = dashboard?.figures;
+export function HistoryDashboard({ range, lastSyncedAt }: {
+  range: HistoryRange;
+  lastSyncedAt: string | null;
+}) {
+  const { history, loading, error } = useHistoryCharts(range, lastSyncedAt);
+  const figures = history?.figures;
   const charts = [
     { title: "Recorded activity by day", figure: figures?.eventsOverTime, interactive: true },
     { title: "Events by weekday and hour", figure: figures?.heatmapEventsByDayHour },
@@ -253,19 +279,19 @@ export function HistoryDashboard({ range }: { range: { beg: string; end: string 
   ];
 
   return (
-    <section className="stack" aria-label="History results" aria-busy={loadingDashboard}>
-      {loadingDashboard && <p role="status">Loading saved activity…</p>}
-      {dashboardError && <p role="alert">{dashboardError}</p>}
-      {dashboard && (
+    <section id="history-results" className="stack" aria-label="History results" aria-busy={loading} tabIndex={-1}>
+      {loading && <p role="status">Loading saved activity…</p>}
+      {error && <p role="alert">{error}</p>}
+      {history && (
         <>
-          <h2>{dashboard.range.beg} → {dashboard.range.end}</h2>
-          {dashboard.noData || dashboard.rangeHasActivity === false ? (
-            <p className="muted">No recorded activity in this period. Your local history may be incomplete.</p>
+          <h2>{history.range.beg} → {history.range.end}</h2>
+          {!history.rangeHasActivity ? (
+            <p className="muted">No recorded activity in this period.</p>
           ) : (
             <>
-              {figures?.activeProjectHierarchy && <HierarchyCard dashboard={dashboard} height={420} />}
+              {figures?.activeProjectHierarchy && <HierarchyCard dashboard={history} height={420} />}
               {charts.map((chart) => chart.figure && (
-                <PlotCard key={`${chart.title}:${dashboard.range.beg}:${dashboard.range.end}`} height={420} persistViewport {...chart} />
+                <PlotCard key={`${chart.title}:${history.range.beg}:${history.range.end}`} height={420} persistViewport {...chart} />
               ))}
             </>
           )}
@@ -288,12 +314,12 @@ export function DashboardView({
     loadingDashboard,
     dashboardError,
     progressDisplay,
+    refreshing,
     retrying,
     granularity,
     setGranularity,
     weeks,
-    setWeeks,
-    refresh
+    setWeeks
   } = useDashboardHome({ enabled: !setupActive });
   const { status, loadingStatus } = useDashboardStatus();
   const { label: syncLabel, title: syncTitle } = useSyncLabel(status);
@@ -322,6 +348,7 @@ export function DashboardView({
     return `${dashboard.range.beg} -> ${dashboard.range.end}`;
   }, [dashboard]);
   const noData = Boolean(dashboard?.noData);
+  const syncError = dashboard?.sync?.dashboardError || dashboard?.sync?.error;
   const dashboardWithUrgency = dashboard as DashboardHomeWithUrgency | null;
   const figures = dashboard?.figures ?? {};
   const plotScope = `${dashboard?.range.weeks ?? weeks}:${dashboard?.range.granularity ?? granularity}`;
@@ -339,7 +366,6 @@ export function DashboardView({
     { id: "stats", label: "Focus" },
     { id: "badges", label: "Badges" },
     { id: "completed-tasks", label: "Completions" },
-    { id: "project-contribution", label: "Projects" },
     { id: "events", label: "Events" },
     { id: "projects", label: "Projects" },
     { id: "ops", label: "Activity & Ops" }
@@ -536,8 +562,8 @@ export function DashboardView({
               { label: syncLabel, tone: "neutral", title: syncTitle },
               { label: periodLabel ?? "" },
               { label: dashboardError ?? "", tone: "warn" },
-              { label: dashboard?.refreshWarning ?? "", tone: "warn" },
-              { label: dashboard?.refreshing ? "Syncing in the background…" : "", tone: "neutral" },
+              { label: syncError ? `${syncError} Showing saved data.` : "", tone: "warn" },
+              { label: refreshing && !dashboardError ? "Syncing in the background…" : "", tone: "neutral" },
               { label: error ?? "", tone: "warn" }
             ]}
           />
@@ -576,9 +602,7 @@ export function DashboardView({
             </select>
           </div>
           <Link className="button buttonGhost" href="/history">Browse activity history</Link>
-          <button className="button" onClick={refresh} disabled={loadingDashboard}>
-            {loadingDashboard ? "Loading..." : "Refresh"}
-          </button>
+          <Link className="button" href="/history?sync=1">Refresh data</Link>
           {dashboard?.refreshedAt && <p className="muted tiny">Updated {dashboard.refreshedAt}</p>}
         </div>
       </header>
@@ -608,9 +632,7 @@ export function DashboardView({
             configuration in the Control Panel.
           </p>
           <div className="emptyStateActions">
-            <button className="button buttonSmall" type="button" onClick={refresh} disabled={loadingDashboard}>
-              {loadingDashboard ? "Loading..." : "Retry sync"}
-            </button>
+            <Link className="button buttonSmall" href="/history?sync=1">Sync activity</Link>
           </div>
         </section>
       ) : null}
@@ -804,20 +826,6 @@ export function DashboardView({
       ) : null}
 
       {!noData ? (
-        <section id="project-contribution" className="card timelinePreview jumpTarget" aria-label="Project Timeline">
-          <div>
-            <p className="eyebrow">Projects</p>
-            <h2>Project Timeline</h2>
-            <p className="muted">
-              {dashboard?.projectTimelineSummary?.parentCount ?? 0} parent projects ·{" "}
-              {dashboard?.projectTimelineSummary?.subprojectCount ?? 0} active or historical subprojects
-            </p>
-          </div>
-          <Link className="button buttonGhost" href="/project-timeline">Open timeline →</Link>
-        </section>
-      ) : null}
-
-      {!noData ? (
         <section id="events" className="stack jumpTarget" aria-label="Event trends">
           {eventPlots.map((plot) => (
             <PlotCard key={`${plot.title}:${plotScope}`} persistViewport {...plot} />
@@ -888,7 +896,7 @@ export function DashboardView({
             </div>
           </header>
           <p className="muted" style={{ marginTop: 0 }}>
-            Refresh data, monitor services, and update settings from the dedicated operations page.
+            Monitor services and update settings.
           </p>
           <a className="button buttonSmall buttonGhost" href="/control-panel">
             Open Control Panel

@@ -57,7 +57,7 @@ final class PlotData {
     TreeMap<LocalDate, Day> daily = new TreeMap<>();
     Map<String, Instant> added = new HashMap<>(), lastCompleted = new HashMap<>();
     Map<String, String> completionProject = new HashMap<>();
-    Map<String, Instant> firstProjectEvent = new HashMap<>(), lastProjectEvent = new HashMap<>();
+    Map<String, Instant> firstProjectEvent = new HashMap<>();
     Map<String, Instant> archivedAt = new HashMap<>(), unarchivedAt = new HashMap<>();
     Map<String, Set<String>> previousNames = new HashMap<>();
     Map<String, TreeMap<LocalDate, Integer>> projectDailyEvents = new HashMap<>();
@@ -100,7 +100,6 @@ final class PlotData {
       if (objectType.equals("item") && projectId.isEmpty()) projectId = UNKNOWN_PROJECT_ID;
       if (!projectId.isEmpty()) {
         firstProjectEvent.merge(projectId, time, PlotData::earlier);
-        lastProjectEvent.merge(projectId, time, PlotData::later);
         projectDailyEvents
             .computeIfAbsent(projectId, ignored -> new TreeMap<>())
             .merge(time.atZone(zone).toLocalDate(), 1, Integer::sum);
@@ -149,12 +148,6 @@ final class PlotData {
     }
 
     JSONArray rawTasks = snapshot.getJSONArray("tasks");
-    Map<String, Integer> openByProject = new HashMap<>();
-    for (int i = 0; i < rawTasks.length(); i++) {
-      JSONObject task = rawTasks.getJSONObject(i);
-      if (!task.optBoolean("checked") && !task.optBoolean("is_deleted"))
-        openByProject.merge(task.optString("project_id"), 1, Integer::sum);
-    }
     JSONArray hierarchy = new JSONArray();
     for (var entry : projects.entrySet()) {
       String id = entry.getKey();
@@ -178,21 +171,21 @@ final class PlotData {
               .put("previousNames", new JSONArray(names))
               .put("parentId", TodoistClient.parentId(project))
               .put("rootName", rootFor.apply(id))
-              .put("color", project.optString("color", "grey"))
               .put("archived", project.optBoolean("is_archived"))
               .put("createdAt", createdAt)
               .put("createdAtSource", createdAtSource)
-              .put("updatedAt", date(project.optString("updated_at"), zone))
-              .put("lastEventAt", date(lastProjectEvent.get(id), zone))
               .put("archivedAt", date(archive, zone))
-              .put("openTasks", openByProject.getOrDefault(id, 0))
               .put("dailyEvents", dailyCounts(projectDailyEvents.get(id)))
               .put("dailyCompletions", dailyCounts(projectDailyCompletions.get(id)))
               .put("weeklyCounts", new JSONObject(projectWeeks.getOrDefault(id, Map.of()))));
     }
     Set<String> unknownProjects = new HashSet<>(projectDailyEvents.keySet());
     unknownProjects.addAll(projectWeeks.keySet());
-    unknownProjects.addAll(openByProject.keySet());
+    for (int i = 0; i < rawTasks.length(); i++) {
+      JSONObject task = rawTasks.getJSONObject(i);
+      if (!task.optBoolean("checked") && !task.optBoolean("is_deleted"))
+        unknownProjects.add(task.optString("project_id"));
+    }
     for (String id : unknownProjects)
       if (!id.isEmpty() && !projects.containsKey(id))
         hierarchy.put(
@@ -202,15 +195,11 @@ final class PlotData {
                 .put("name", "Unknown project")
                 .put("previousNames", new JSONArray(previousNames.getOrDefault(id, Set.of())))
                 .put("parentId", "")
-                .put("rootName", "Unknown project")
-                .put("color", "grey")
+                .put("rootName", rootFor.apply(id))
                 .put("archived", false)
                 .put("createdAt", date(firstProjectEvent.get(id), zone))
                 .put("createdAtSource", firstProjectEvent.containsKey(id) ? "activity" : "unknown")
-                .put("updatedAt", "")
-                .put("lastEventAt", date(lastProjectEvent.get(id), zone))
                 .put("archivedAt", "")
-                .put("openTasks", openByProject.getOrDefault(id, 0))
                 .put("dailyEvents", dailyCounts(projectDailyEvents.get(id)))
                 .put("dailyCompletions", dailyCounts(projectDailyCompletions.get(id)))
                 .put("weeklyCounts", new JSONObject(projectWeeks.getOrDefault(id, Map.of()))));

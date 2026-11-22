@@ -1,29 +1,48 @@
 """Tests for FastAPI dashboard home endpoints."""
 
+import asyncio
+import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from typing import cast
+from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import pytest
+from fastapi import HTTPException
 
 from tests.factories import make_project, make_project_entry, make_task
 from tests.unit.database.helpers import make_event
-from tests.web_api_helpers import (
-    _clear_dashboard_state,
-    _set_state_with_df,
-    _single_event_df,
-    _stub_all_figures,
-)
-import todometry.web.api as web_api
+from tests.web_api_helpers import _single_event_df
+from todometry.api.client import TodoistAPIClient
+from todometry.core.env import EnvVar
+from todometry.core.utils import Cache
+from todometry.database.dataframe import render_adjustments_file_content
 import todometry.web.routes.dashboard as dashboard_routes
-from todometry.web.api_components import dashboard_runtime
+from todometry.web.api_components import dashboard_runtime, runtime
+from todometry.web.api_components.dashboard_runtime import (
+    DashboardSnapshot,
+    DashboardState,
+)
+from todometry.web.api_components.runtime import REPO_ROOT
+from todometry.web.routes import admin_settings
 
 # pylint: disable=protected-access
 
 
-async def _noop_ensure_state(*, refresh: bool) -> None:
-    _ = refresh
+@pytest.fixture
+def saved_dashboard(monkeypatch, tmp_path, api_client):
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path / "cache"))
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(tmp_path))
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv("API_KEY", "")
+
+    def seed(activity, **metadata):
+        snapshot = DashboardSnapshot(activity, last_refresh_s=time.time(), **metadata)
+        api_client.app.state.dashboard.snapshot = snapshot
+        return snapshot
+
+    return seed
 
 
 def _event_df(rows: list[dict[str, str]]) -> pd.DataFrame:
@@ -48,18 +67,16 @@ def _empty_event_df() -> pd.DataFrame:
     ).iloc[:0]
 
 
-def _set_dashboard_df(monkeypatch, df: pd.DataFrame) -> None:
-    monkeypatch.setattr(web_api, "_ensure_state", _noop_ensure_state)
-    _stub_all_figures(monkeypatch)
-    _set_state_with_df(df)
-
-
 def _home(api_client, query: str = "weeks=12&granularity=W"):
     return api_client.get(f"/api/dashboard/home?{query}")
 
 
+def _history(api_client, beg: str, end: str):
+    return api_client.get("/api/dashboard/history", params={"beg": beg, "end": end})
+
+
 def test_project_timeline_endpoint_returns_structured_archived_history(
-    monkeypatch, api_client
+    api_client, saved_dashboard, tmp_path
 ) -> None:
     root = make_project(
         project_id="root",
@@ -92,9 +109,9 @@ def test_project_timeline_endpoint_returns_structured_archived_history(
             }
         ]
     )
-    _set_dashboard_df(monkeypatch, activity)
-    web_api._state.active_projects = [root]
-    web_api._state.archived_projects = [child]
+    snapshot = saved_dashboard(
+        activity, active_projects=[root], archived_projects=[child]
+    )
 
     response = api_client.get(
         "/api/dashboard/project-timeline?beg=2026-08-01&end=2026-08-31"
@@ -110,36 +127,52 @@ def test_project_timeline_endpoint_returns_structured_archived_history(
     full_history = api_client.get("/api/dashboard/project-timeline").json()
     assert full_history["range"]["start"] == "2026-08-18"
 
+    sibling = make_project(
+        project_id="sibling",
+        name="Upcoming",
+        parent_id="root",
+        created_at="2026-08-01T00:00:00Z",
+        updated_at="2026-08-20T00:00:00Z",
+    )
+    snapshot.active_projects.append(sibling)
+    archived_group = {"targetId": "child", "targetName": "Shipped"}
+    personal = tmp_path / "personal"
+    personal.mkdir()
+    (personal / "adj_private.py").write_text(
+        render_adjustments_file_content(
+            {}, [], {"child": archived_group, "sibling": archived_group}
+        ),
+        encoding="utf-8",
+    )
+    grouped = api_client.get(
+        "/api/dashboard/project-timeline?beg=2026-08-01&end=2026-08-31"
+    ).json()
+    assert [parent["id"] for parent in grouped["parents"]] == ["child"]
+    assert {item["id"] for item in grouped["parents"][0]["children"]} == {
+        "child",
+        "sibling",
+    }
+
 
 def test_hierarchy_playback_builds_cumulative_frames_on_demand(
-    monkeypatch, api_client
+    api_client, saved_dashboard
 ) -> None:
     activity = _event_df(
         [
             {
-                "date": "2026-08-02",
-                "id": "e1",
+                "date": timestamp,
+                "id": f"e{index}",
                 "title": "done",
                 "type": "completed",
                 "parent_project_id": "root",
                 "parent_project_name": "Product",
                 "root_project_name": "Product",
-                "task_id": "1",
+                "task_id": str(index),
             }
+            for index, timestamp in enumerate(["2026-08-02", "2026-08-14"])
         ]
     )
-    _set_dashboard_df(monkeypatch, activity)
-    web_api._state.active_projects = [make_project(project_id="root")]
-    web_api._state.archived_projects = []
-    web_api._state.project_colors = {}
-    web_api._state.home_payload_cache = {}
-    windows = []
-
-    def capture_frame(df, beg, end, *args, **kwargs):
-        windows.append((beg, end))
-        return go.Figure()
-
-    monkeypatch.setattr(web_api, "plot_active_project_hierarchy", capture_frame)
+    saved_dashboard(activity, active_projects=[make_project(project_id="root")])
     response = api_client.get(
         "/api/dashboard/hierarchy-playback?beg=2026-08-01&end=2026-08-14"
     )
@@ -147,20 +180,15 @@ def test_hierarchy_playback_builds_cumulative_frames_on_demand(
     assert response.status_code == 200
     frames = response.json()["frames"]
     assert len(frames) == 14
-    assert all(beg == windows[0][0] for beg, _ in windows)
-    assert windows[0][1] < windows[-1][1]
+    assert frames[0]["date"] == "2026-08-01"
+    assert frames[1]["figure"]["data"][0]["values"][0] == 1
+    assert frames[-1]["figure"]["data"][0]["values"][0] == 2
     assert frames[-1]["date"] == "2026-08-14"
-    api_client.get("/api/dashboard/hierarchy-playback?beg=2026-08-01&end=2026-08-14")
-    assert len(windows) == 14
 
 
 def test_hierarchy_playback_matches_rolling_dashboard_boundaries(
-    monkeypatch, api_client
+    api_client, saved_dashboard
 ) -> None:
-    from todometry.dashboard._plot_project_hierarchy import (
-        plot_active_project_hierarchy_sunburst,
-    )
-
     activity = _event_df(
         [
             {
@@ -178,13 +206,7 @@ def test_hierarchy_playback_matches_rolling_dashboard_boundaries(
             )
         ]
     )
-    _set_dashboard_df(monkeypatch, activity)
-    web_api._state.active_projects = [make_project(project_id="root")]
-    monkeypatch.setattr(dashboard_routes, "get_adjusting_mapping", dict)
-    monkeypatch.setattr(dashboard_routes, "get_adjusting_archived_parent_projects", set)
-    monkeypatch.setattr(
-        web_api, "plot_active_project_hierarchy", plot_active_project_hierarchy_sunburst
-    )
+    saved_dashboard(activity, active_projects=[make_project(project_id="root")])
     current = _home(api_client, "weeks=12&granularity=W").json()
     assert current["range"]["mode"] == "rolling"
     playback = api_client.get("/api/dashboard/hierarchy-playback?weeks=12").json()
@@ -199,26 +221,27 @@ def test_hierarchy_playback_matches_rolling_dashboard_boundaries(
         "/api/dashboard/hierarchy-playback?beg=2026-08-24&end=2026-11-16"
     ).json()
     assert custom["figures"]["activeProjectHierarchy"]["data"][0]["values"][0] == 3
-    assert custom["figures"]["activeProjectHierarchy"]["data"][0]["values"] == (
-        custom_playback["frames"][-1]["figure"]["data"][0]["values"]
+    assert (
+        custom["figures"]["activeProjectHierarchy"]["data"][0]["values"]
+        == (custom_playback["frames"][-1]["figure"]["data"][0]["values"])
     )
 
 
-def _dashboard_cache(monkeypatch, tmp_path) -> web_api.Cache:
-    monkeypatch.setenv(str(web_api.EnvVar.CACHE_DIR), str(tmp_path))
+def _dashboard_cache(monkeypatch, tmp_path) -> Cache:
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    cache = web_api.Cache()
+    cache = Cache()
     cache.activity.save(set())
     return cache
 
 
-def _save_dashboard_snapshot(cache: web_api.Cache, **overrides) -> None:
+def _save_dashboard_snapshot(cache: Cache, **overrides) -> None:
     payload = {
-        "version": web_api._DASHBOARD_STATE_SCHEMA_VERSION,
+        "version": dashboard_runtime._DASHBOARD_STATE_SCHEMA_VERSION,
         "created_at": "2025-01-01T00:00:00",
         "last_refresh_s": 123.0,
         "demo_mode": False,
-        "activity_cache_signature": web_api._activity_cache_signature(),
+        "activity_cache_signature": dashboard_runtime._activity_cache_signature(cache),
         "adjustments_cache_signature": [],
         "df_activity": _single_event_df(),
         "active_projects": [],
@@ -234,39 +257,248 @@ def test_history_reads_saved_dashboard_without_sync(
     monkeypatch, tmp_path, api_client, source
 ) -> None:
     cache = _dashboard_cache(monkeypatch, tmp_path)
-    state = web_api._DashboardState()
-    monkeypatch.setattr(web_api, "_state", state)
-    monkeypatch.setattr(web_api, "_env_demo_mode", lambda: False)
-    monkeypatch.setenv(str(web_api.EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
-    _stub_all_figures(monkeypatch)
+    state = api_client.app.state.dashboard
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "UTC")
 
     def unexpected_sync(*args, **kwargs):
         pytest.fail("History must not schedule or run a Todoist sync")
 
-    monkeypatch.setattr(dashboard_runtime, "_schedule_stale_state_refresh", unexpected_sync)
-    monkeypatch.setattr(web_api, "_refresh_state_sync", unexpected_sync)
-    if source == "memory":
-        _set_state_with_df(_single_event_df())
-    elif source == "disk":
-        _save_dashboard_snapshot(cache)
+    monkeypatch.setattr(
+        dashboard_runtime, "_schedule_stale_state_refresh", unexpected_sync
+    )
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", unexpected_sync)
+    monkeypatch.setattr(TodoistAPIClient, "request_json", unexpected_sync)
+    if source == "missing":
+        Path(cache.activity.path).unlink()
+    else:
+        cache.activity.save({make_event("e1", date=datetime(2025, 1, 15))})
+        if source == "memory":
+            state.snapshot = DashboardSnapshot(
+                df_activity=_single_event_df(),
+                activity_cache_signature=dashboard_runtime._activity_cache_signature(
+                    cache
+                ),
+            )
+        else:
+            _save_dashboard_snapshot(cache)
 
-    home = _home(api_client, "cached_only=true&refresh=true&beg=2025-01-15&end=2025-01-15")
+    history = _history(api_client, "2025-01-15", "2025-01-15")
     playback = api_client.get(
         "/api/dashboard/hierarchy-playback?cached_only=true&beg=2025-01-15&end=2025-01-15"
     )
     if source == "missing":
-        assert home.status_code == playback.status_code == 409
-        assert "Saved history is unavailable" in home.json()["detail"]
+        assert history.status_code == playback.status_code == 409
+        assert "Saved history is unavailable" in history.json()["detail"]
         return
 
-    assert home.status_code == playback.status_code == 200
-    assert home.json()["rangeHasActivity"] is True
+    assert history.status_code == playback.status_code == 200
+    assert history.json()["rangeHasActivity"] is True
+    assert history.json()["eventCount"] == 1
     assert playback.json()["frames"]
-    without_activity = _home(
-        api_client, "cached_only=true&beg=2025-01-14&end=2025-01-14"
-    )
+    without_activity = _history(api_client, "2025-01-14", "2025-01-14")
     assert without_activity.status_code == 200
     assert without_activity.json()["rangeHasActivity"] is False
+    assert without_activity.json()["figures"] == {}
+
+
+@pytest.mark.parametrize(
+    ("beg", "end", "month", "start_utc", "stop_utc"),
+    [
+        ("2024-12-30", "2025-01-05", "2025-01", "2024-12-29T23:00", "2025-01-05T23:00"),
+        ("2025-03-24", "2025-03-30", "2025-03", "2025-03-23T23:00", "2025-03-30T22:00"),
+    ],
+    ids=["year-boundary", "dst-23-hour-sunday"],
+)
+def test_history_week_builds_only_its_four_figures_and_matches_calendar(
+    monkeypatch, tmp_path, api_client, beg, end, month, start_utc, stop_utc
+) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "Europe/Warsaw")
+    start = datetime.fromisoformat(start_utc).replace(tzinfo=timezone.utc)
+    stop = datetime.fromisoformat(stop_utc).replace(tzinfo=timezone.utc)
+    completed = make_event("at-start", date=start)
+    added = make_event("before-start", date=start - timedelta(minutes=1))
+    added.event_entry.event_type = "added"
+    added.event_entry.object_id = completed.event_entry.object_id
+    archived = make_event("archived", date=start + timedelta(hours=1))
+    archived.event_entry.object_type = "project"
+    archived.event_entry.event_type = "archived"
+    archived.event_entry.extra_data = None
+    cache.activity.save(
+        {
+            added,
+            completed,
+            archived,
+            make_event("before-end", date=stop - timedelta(seconds=1)),
+            make_event("at-end", date=stop),
+        }
+    )
+    _save_dashboard_snapshot(
+        cache,
+        activity_cache_signature=None,
+        active_projects=[make_project(project_id="proj1", name="Work")],
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Reading a saved week ran sync or Overview-only work")
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", unexpected)
+    monkeypatch.setattr(dashboard_runtime, "_schedule_stale_state_refresh", unexpected)
+    for name in (
+        "plot_weekly_completion_trend",
+        "plot_task_count_trend",
+        "plot_completed_tasks_periodically",
+        "cumsum_completed_tasks_periodically",
+        "_extract_metrics_dict",
+        "_compute_insights",
+        "_build_habit_tracker_payload",
+        "_completed_share_leaderboard",
+        "read_yaml_config",
+    ):
+        monkeypatch.setattr(dashboard_routes, name, unexpected)
+
+    plots = {
+        "eventsOverTime": "plot_events_over_time",
+        "heatmapEventsByDayHour": "plot_heatmap_of_events_by_day_and_hour",
+        "taskLifespansPeriod": "plot_task_lifespans",
+        "activeProjectHierarchy": "plot_active_project_hierarchy",
+    }
+    built = {key: [] for key in plots}
+
+    def record(key, plot):
+        def build(*args, **kwargs):
+            figure = plot(*args, **kwargs)
+            built[key].append(figure)
+            return figure
+
+        return build
+
+    for key, name in plots.items():
+        monkeypatch.setattr(
+            dashboard_routes, name, record(key, getattr(dashboard_routes, name))
+        )
+
+    response = _history(api_client, beg, end)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["range"] == {"beg": beg, "end": end, "mode": "custom"}
+    assert payload["timeZone"] == "Europe/Warsaw"
+    assert payload["eventCount"] == 3
+    assert set(payload["figures"]) == set(plots)
+    assert all(len(figures) == 1 for figures in built.values())
+
+    days = api_client.get("/api/activity/status", params={"month": month}).json()[
+        "days"
+    ]
+    counts = Counter()
+    for trace in built["eventsOverTime"][0].data:
+        for stamp, count in zip(trace.x, trace.y, strict=True):
+            counts[pd.Timestamp(stamp).date().isoformat()] += int(count)
+    assert counts == {
+        day: value["eventCount"] for day, value in days.items() if beg <= day <= end
+    }
+    assert counts[beg] == 2
+    assert counts[end] == 1
+
+    heatmap = built["heatmapEventsByDayHour"][0].data[0].z
+    assert sum(sum(row) for row in heatmap) == 3
+    assert heatmap[0][0] == heatmap[0][1] == heatmap[6][23] == 1
+    assert built["activeProjectHierarchy"][0].data[0].values[0] == 2
+    assert (
+        built["taskLifespansPeriod"][0].layout.title.text
+        == "Task Lifespans: Time to Completion"
+    )
+    assert api_client.app.state.dashboard.sync.task is None
+
+
+def test_history_extends_the_axis_to_the_chosen_end_without_future_observations(
+    monkeypatch, tmp_path, api_client
+) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "UTC")
+    monkeypatch.setattr(
+        dashboard_routes, "_end_of_today", lambda _calendar: datetime(2025, 1, 16)
+    )
+    cache.activity.save({make_event("observed", date=datetime(2025, 1, 15, 9))})
+
+    response = _history(api_client, "2025-01-13", "2025-01-19")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["eventCount"] == 1
+    chart = payload["figures"]["eventsOverTime"]
+    assert chart["layout"]["xaxis"]["range"] == [
+        "2025-01-13T00:00:00",
+        "2025-01-20T00:00:00",
+    ]
+    assert chart["data"]
+    assert all(
+        [str(stamp)[:10] for stamp in trace["x"]]
+        == ["2025-01-13", "2025-01-14", "2025-01-15"]
+        for trace in chart["data"]
+    )
+
+
+def test_history_rebuilds_stale_snapshot_offline_after_activity_sync(
+    monkeypatch, tmp_path, api_client
+) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "Europe/Warsaw")
+    cache.activity.save({make_event("legacy", date=datetime(2025, 1, 15, 12))})
+    project = make_project(
+        project_id="proj1",
+        project_entry=make_project_entry(
+            project_id="proj1", name="Saved project", parent_id="missing-parent"
+        ),
+    )
+    _save_dashboard_snapshot(cache, active_projects=[project])
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+
+    def unexpected_todoist_request(*args, **kwargs):
+        pytest.fail("Rebuilding saved charts contacted Todoist")
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", unexpected_todoist_request)
+
+    assert _history(api_client, "2025-01-16", "2025-01-16").json()["eventCount"] == 0
+    fresh = make_event("fresh", date=datetime(2025, 1, 15, 23, 30, tzinfo=timezone.utc))
+    cache.activity.update(lambda events: events | {fresh})
+
+    history = _history(api_client, "2025-01-16", "2025-01-16")
+    playback = api_client.get(
+        "/api/dashboard/hierarchy-playback?cached_only=true&beg=2025-01-16&end=2025-01-16"
+    )
+
+    assert history.status_code == 200
+    assert history.json()["rangeHasActivity"] is True
+    assert history.json()["eventCount"] == 1
+    assert playback.json()["frames"][-1]["date"] == "2025-01-16"
+    activity = api_client.app.state.dashboard.snapshot.df_activity
+    assert activity["id"].tolist() == ["legacy", "fresh"]
+    assert activity["parent_project_name"].tolist() == ["Saved project"] * 2
+
+
+def test_failed_explicit_dashboard_refresh_uses_saved_snapshot(
+    monkeypatch, tmp_path, api_client
+) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    _save_dashboard_snapshot(cache)
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv("API_KEY", "")
+
+    def offline(state, *, source, result):
+        raise ConnectionError("project metadata unavailable")
+
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", offline)
+
+    response = _home(api_client, "refresh=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sync"]["dashboardError"] == "Could not update the dashboard."
+    assert payload["figures"]
 
 
 def test_load_state_from_disk_cache_restores_payload(monkeypatch, tmp_path) -> None:
@@ -274,14 +506,16 @@ def test_load_state_from_disk_cache_restores_payload(monkeypatch, tmp_path) -> N
     df = _single_event_df()
     _save_dashboard_snapshot(cache, df_activity=df, project_colors={"A": "#123456"})
 
-    _clear_dashboard_state()
-    loaded = web_api._load_state_from_disk_cache(demo_mode=False)
+    state = DashboardState()
+    loaded = dashboard_runtime._load_state_from_disk_cache(
+        state, source=runtime.sync_source(demo_mode=False), cache=cache
+    )
     assert loaded is True
-    assert web_api._state.df_activity is not None
-    assert len(web_api._state.df_activity) == 1
-    assert web_api._state.project_colors == {"A": "#123456"}
-    assert web_api._state.active_projects == []
-    assert web_api._state.archived_projects == []
+    assert state.snapshot.df_activity is not None
+    assert len(state.snapshot.df_activity) == 1
+    assert state.snapshot.project_colors == {"A": "#123456"}
+    assert state.snapshot.active_projects == []
+    assert state.snapshot.archived_projects == []
 
 
 def test_load_state_from_disk_cache_rejects_stale_activity_signature(
@@ -293,8 +527,10 @@ def test_load_state_from_disk_cache_rejects_stale_activity_signature(
     # Mutate activity cache so signature no longer matches cached dashboard snapshot.
     cache.activity.save({"new-event"})
 
-    _clear_dashboard_state()
-    loaded = web_api._load_state_from_disk_cache(demo_mode=False)
+    state = DashboardState()
+    loaded = dashboard_runtime._load_state_from_disk_cache(
+        state, source=runtime.sync_source(demo_mode=False), cache=cache
+    )
     assert loaded is False
 
 
@@ -314,11 +550,14 @@ def test_project_refresh_reuses_snapshot_when_activity_signature_changes(
         last_refresh_s=refreshed_at,
     )
     cache.activity.save({make_event("new-event")})
-    _clear_dashboard_state()
+    state = DashboardState()
 
-    assert web_api._load_state_from_disk_cache(demo_mode=False) is False
-    projects, archived, snapshot_time = web_api._call_dashboard_runtime(
-        "_project_refresh_baseline", demo_mode=False
+    source = runtime.sync_source(demo_mode=False)
+    assert not dashboard_runtime._load_state_from_disk_cache(
+        state, source=source, cache=cache
+    )
+    projects, archived, snapshot_time = dashboard_runtime._project_refresh_baseline(
+        state, source=source, cache=cache
     )
 
     assert projects is not None
@@ -357,33 +596,12 @@ def test_project_refresh_counts_events_since_snapshot_even_if_already_cached() -
         parent_project_id="old-project",
     )
 
-    project_ids = web_api._call_dashboard_runtime(
-        "_project_ids_changed_since", {changed, old}, refreshed_at
+    project_ids = dashboard_runtime._project_ids_changed_since(
+        {changed, old}, refreshed_at
     )
 
     assert "changed-project" in project_ids
     assert "old-project" not in project_ids
-
-
-def test_in_memory_dashboard_state_rejects_changed_activity_signature(
-    monkeypatch, tmp_path
-) -> None:
-    cache = _dashboard_cache(monkeypatch, tmp_path)
-    _clear_dashboard_state()
-    _set_state_with_df(_single_event_df())
-    web_api._state.activity_cache_signature = web_api._activity_cache_signature()
-
-    assert web_api._state.is_ready_for(
-        demo_mode=False,
-        activity_cache_signature=web_api._activity_cache_signature(),
-    )
-
-    cache.activity.save({"new-event"})
-
-    assert not web_api._state.is_ready_for(
-        demo_mode=False,
-        activity_cache_signature=web_api._activity_cache_signature(),
-    )
 
 
 def test_load_state_from_disk_cache_rejects_stale_adjustment_signature(
@@ -399,23 +617,108 @@ def test_load_state_from_disk_cache_rejects_stale_adjustment_signature(
         encoding="utf-8",
     )
 
-    _clear_dashboard_state()
-    loaded = web_api._load_state_from_disk_cache(demo_mode=False)
+    state = DashboardState()
+    loaded = dashboard_runtime._load_state_from_disk_cache(
+        state, source=runtime.sync_source(demo_mode=False), cache=cache
+    )
     assert loaded is False
+
+
+@pytest.mark.parametrize(
+    "projection_only", [False, True], ids=["saved-events", "saved-projection"]
+)
+def test_history_reflects_saved_project_rules_using_local_metadata(
+    monkeypatch, tmp_path, api_client, projection_only
+) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
+    monkeypatch.setenv(str(EnvVar.PERSONAL_DIR), str(tmp_path / "personal"))
+    monkeypatch.setenv(str(EnvVar.TIMEZONE), "UTC")
+    event = make_event("saved-event", parent_project_id="child")
+    if projection_only:
+        Path(cache.activity.path).unlink()
+    else:
+        cache.activity.save({event})
+    previous = make_project(project_id="previous", name="Work")
+    child = make_project(project_id="child", name="Child", parent_id="previous")
+    archive = make_project(project_id="archive", name="Archive", is_archived=True)
+    _save_dashboard_snapshot(
+        cache,
+        activity_cache_signature=None,
+        active_projects=[previous, child],
+        archived_projects=[archive],
+        df_activity=_event_df(
+            [
+                {
+                    "date": event.date.isoformat(),
+                    "id": event.id,
+                    "type": "completed",
+                    "task_id": "task",
+                    "parent_project_id": "child",
+                    "parent_project_name": "Child",
+                    "root_project_id": "previous",
+                    "root_project_name": "Work",
+                }
+            ]
+        ),
+    )
+
+    def unexpected_todoist_request(*args, **kwargs):
+        pytest.fail("Rebuilding mapped history contacted Todoist")
+
+    monkeypatch.setattr(TodoistAPIClient, "request_json", unexpected_todoist_request)
+    old = _history(api_client, "2024-01-01", "2024-01-01")
+    assert old.status_code == 200
+    assert (
+        old.json()["figures"]["activeProjectHierarchy"]["data"][0]["ids"][1]
+        == "previous"
+    )
+
+    monkeypatch.setattr(
+        admin_settings,
+        "_load_projects_for_adjustments_sync",
+        lambda _db, _refresh: [previous, child, archive],
+    )
+    group = {"targetId": "archive", "targetName": "Archive"}
+    saved = api_client.put(
+        "/api/admin/project_adjustments?file=projects.py",
+        json={"projectMappings": {"archive": group, "child": group}},
+    )
+    assert saved.status_code == 200
+
+    updated = _history(api_client, "2024-01-01", "2024-01-01")
+    assert updated.status_code == 200
+    assert updated.json()["eventCount"] == old.json()["eventCount"] == 1
+    assert (
+        updated.json()["figures"]["activeProjectHierarchy"]["data"][0]["ids"][1]
+        == "archive"
+    )
+
+    state = api_client.app.state.dashboard
+    assert state.snapshot.df_activity.iloc[0]["root_project_id"] == "archive"
+    assert state.snapshot.df_activity.iloc[0]["root_project_name"] == "Archive"
+    assert state.snapshot.db is None
+    if projection_only:
+        assert not Path(cache.activity.path).exists()
+    else:
+        assert {item.id for item in cache.activity.load()} == {"saved-event"}
 
 
 def test_load_state_from_disk_cache_rejects_legacy_demo_snapshot(
     monkeypatch, tmp_path
 ) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
     _save_dashboard_snapshot(
-        _dashboard_cache(monkeypatch, tmp_path),
+        cache,
         demo_mode=True,
-        demo_state_version=web_api._DEMO_DASHBOARD_STATE_SCHEMA_VERSION - 1,
+        demo_state_version=dashboard_runtime._DEMO_DASHBOARD_STATE_SCHEMA_VERSION - 1,
         project_colors={"A": "#123456"},
     )
 
-    _clear_dashboard_state()
-    loaded = web_api._load_state_from_disk_cache(demo_mode=True)
+    state = DashboardState()
+    loaded = dashboard_runtime._load_state_from_disk_cache(
+        state, source=runtime.sync_source(demo_mode=True), cache=cache
+    )
     assert loaded is False
 
 
@@ -427,101 +730,56 @@ def test_load_state_from_disk_cache_restores_current_demo_snapshot(
     _save_dashboard_snapshot(
         cache,
         demo_mode=True,
-        demo_state_version=web_api._DEMO_DASHBOARD_STATE_SCHEMA_VERSION,
+        demo_state_version=dashboard_runtime._DEMO_DASHBOARD_STATE_SCHEMA_VERSION,
         df_activity=df,
         project_colors={"A": "#123456"},
     )
 
-    _clear_dashboard_state()
-    loaded = web_api._load_state_from_disk_cache(demo_mode=True)
+    state = DashboardState()
+    loaded = dashboard_runtime._load_state_from_disk_cache(
+        state, source=runtime.sync_source(demo_mode=True), cache=cache
+    )
     assert loaded is True
-    assert web_api._state.df_activity is not None
-    assert len(web_api._state.df_activity) == 1
-    assert web_api._state.project_colors == {"A": "#123456"}
-    assert web_api._state.active_projects == []
-    assert web_api._state.archived_projects == []
-    assert web_api._state.demo_mode is True
+    assert state.snapshot.df_activity is not None
+    assert len(state.snapshot.df_activity) == 1
+    assert state.snapshot.project_colors == {"A": "#123456"}
+    assert state.snapshot.active_projects == []
+    assert state.snapshot.archived_projects == []
+    assert state.snapshot.demo_mode is True
 
 
 def test_dashboard_home_bootstraps_from_disk_cache_without_refresh(
-    monkeypatch, api_client
+    monkeypatch, tmp_path, api_client
 ) -> None:
-    _stub_all_figures(monkeypatch)
-    _clear_dashboard_state()
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    _save_dashboard_snapshot(cache, last_refresh_s=time.time())
+    monkeypatch.setenv(str(EnvVar.DASHBOARD_DEMO), "0")
 
-    def _fake_load_state_from_disk_cache(*, demo_mode: bool) -> bool:
-        import time
+    def unexpected_refresh(state, *, source, result):
+        pytest.fail("Dashboard startup must reuse the fresh saved snapshot")
 
-        _ = demo_mode
-        _set_state_with_df(_single_event_df())
-        web_api._state.demo_mode = False
-        web_api._state.last_refresh_s = time.time()
-        return True
-
-    def _unexpected_refresh(*, demo_mode: bool) -> None:
-        _ = demo_mode
-        raise AssertionError(
-            "_refresh_state_sync should not run when disk cache is ready"
-        )
-
-    monkeypatch.setattr(
-        web_api, "_load_state_from_disk_cache", _fake_load_state_from_disk_cache
-    )
-    monkeypatch.setattr(web_api, "_refresh_state_sync", _unexpected_refresh)
-    monkeypatch.setattr(web_api, "_env_demo_mode", lambda: False)
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", unexpected_refresh)
 
     res = _home(api_client)
     assert res.status_code == 200
+    state = api_client.app.state.dashboard
+    assert state.snapshot.df_activity["id"].tolist() == ["e1"]
+    assert state.sync.task is None
 
 
-def test_dashboard_home_validates_weeks(monkeypatch, api_client) -> None:
-    _set_dashboard_df(
-        monkeypatch,
-        _event_df(
-            [
-                {
-                    "date": "2025-01-15",
-                    "id": "e1",
-                    "title": "t1",
-                    "type": "completed",
-                    "parent_project_name": "A",
-                    "root_project_name": "A",
-                    "task_id": "1",
-                }
-            ]
-        ),
-    )
+@pytest.mark.parametrize(
+    "query", ["weeks=10000", "beg=2025-01-01"], ids=["weeks-too-large", "missing-end"]
+)
+def test_dashboard_home_rejects_invalid_ranges(api_client, saved_dashboard, query) -> None:
+    saved_dashboard(_single_event_df())
 
-    res = _home(api_client, "weeks=10000")
-    assert res.status_code == 400
-
-
-def test_dashboard_home_requires_beg_and_end(monkeypatch, api_client) -> None:
-    _set_dashboard_df(
-        monkeypatch,
-        _event_df(
-            [
-                {
-                    "date": "2025-01-15",
-                    "id": "e1",
-                    "title": "t1",
-                    "type": "completed",
-                    "parent_project_name": "A",
-                    "root_project_name": "A",
-                    "task_id": "1",
-                }
-            ]
-        ),
-    )
-
-    res = _home(api_client, "beg=2025-01-01")
-    assert res.status_code == 400
+    assert _home(api_client, query).status_code == 400
 
 
 def test_task_count_trend_uses_selected_dashboard_viewport(
-    monkeypatch, api_client
+    api_client, saved_dashboard
 ) -> None:
-    _set_dashboard_df(monkeypatch, _single_event_df())
+    saved_dashboard(_single_event_df())
 
     res = _home(
         api_client,
@@ -534,11 +792,61 @@ def test_task_count_trend_uses_selected_dashboard_viewport(
     assert xaxis["rangeslider"]["visible"] is True
 
 
-def test_dashboard_home_last_completed_week_parent_share(
-    monkeypatch, api_client
+@pytest.mark.parametrize(
+    ("granularity", "forecast_date", "viewport_end"),
+    [
+        ("W", "2025-05-11T00:00:00", "2025-05-12T00:00:00"),
+        ("ME", "2025-05-31T00:00:00", "2025-06-01T00:00:00"),
+        ("3ME", "2025-06-30T00:00:00", "2025-07-01T00:00:00"),
+    ],
+)
+def test_dashboard_completion_charts_show_the_entire_forecast_period(
+    monkeypatch, api_client, saved_dashboard, granularity, forecast_date, viewport_end
 ) -> None:
-    _set_dashboard_df(
-        monkeypatch,
+    monkeypatch.setenv("TODOIST_TIMEZONE", "Europe/Warsaw")
+    saved_dashboard(
+        _event_df(
+            [
+                {
+                    "date": timestamp,
+                    "id": str(index),
+                    "title": "done",
+                    "type": "completed",
+                    "parent_project_name": "Product",
+                    "root_project_name": "Product",
+                    "task_id": str(index),
+                }
+                for index, timestamp in enumerate(
+                    ["2025-02-20T09:00:00", "2025-05-07T10:00:00"]
+                )
+            ]
+        ),
+    )
+    rolling = _home(api_client, f"weeks=12&granularity={granularity}").json()
+    history = _home(
+        api_client, f"beg=2025-05-04&end=2025-05-07&granularity={granularity}"
+    ).json()
+    assert rolling["range"]["end"] == "2025-05-07"
+
+    for key in ("completedTasksPeriodically", "cumsumCompletedTasksPeriodically"):
+        figure = rolling["figures"][key]
+        forecast = next(
+            trace for trace in figure["data"] if trace["name"] == "Product (forecast)"
+        )
+        assert forecast["x"] == [forecast_date]
+        axis = figure["layout"]["xaxis"]
+        assert axis["range"] == ["2025-02-12T11:00:00.000001", viewport_end]
+        assert axis["rangeslider"]["visible"] is True
+        assert history["figures"][key]["layout"]["xaxis"]["range"] == [
+            "2025-05-04T00:00:00",
+            "2025-05-08T00:00:00",
+        ]
+
+
+def test_dashboard_home_last_completed_week_parent_share(
+    api_client, saved_dashboard
+) -> None:
+    saved_dashboard(
         _event_df(
             [
                 {
@@ -611,8 +919,8 @@ def test_dashboard_home_last_completed_week_parent_share(
     assert abs(by_name["Parent B"]["percentOfCompleted"] - 33.33) < 0.02
 
 
-def test_dashboard_home_handles_empty_activity(monkeypatch, api_client) -> None:
-    _set_dashboard_df(monkeypatch, _empty_event_df())
+def test_dashboard_home_handles_empty_activity(api_client, saved_dashboard) -> None:
+    saved_dashboard(_empty_event_df())
 
     res = _home(api_client, "weeks=12")
     assert res.status_code == 200
@@ -622,9 +930,8 @@ def test_dashboard_home_handles_empty_activity(monkeypatch, api_client) -> None:
     assert payload.get("noData") is True
 
 
-def test_dashboard_home_includes_habit_tracker_summary(monkeypatch, api_client) -> None:
-    _set_dashboard_df(
-        monkeypatch,
+def test_dashboard_home_includes_habit_tracker_summary(api_client, saved_dashboard) -> None:
+    snapshot = saved_dashboard(
         _event_df(
             [
                 {
@@ -657,7 +964,7 @@ def test_dashboard_home_includes_habit_tracker_summary(monkeypatch, api_client) 
             ]
         ),
     )
-    web_api._state.active_projects = [
+    snapshot.active_projects = [
         make_project(
             project_id="project-1",
             project_entry=make_project_entry(
@@ -675,9 +982,7 @@ def test_dashboard_home_includes_habit_tracker_summary(monkeypatch, api_client) 
             ],
         )
     ]
-    web_api._state.project_colors = {"Health": "#00aa88"}
-    web_api._state.db = None
-    web_api._state.home_payload_cache = {}
+    snapshot.project_colors = {"Health": "#00aa88"}
 
     res = _home(api_client)
     assert res.status_code == 200
@@ -692,7 +997,7 @@ def test_dashboard_home_includes_habit_tracker_summary(monkeypatch, api_client) 
 
 
 def test_dashboard_home_normalizes_integer_activity_index(
-    monkeypatch, api_client
+    api_client, saved_dashboard
 ) -> None:
     df = pd.DataFrame(
         [
@@ -717,8 +1022,7 @@ def test_dashboard_home_normalizes_integer_activity_index(
         ]
     )
     df.index = [0, 1]
-    _set_dashboard_df(monkeypatch, df)
-    web_api._state.project_colors = {"Health": "#00aa88"}
+    saved_dashboard(df, project_colors={"Health": "#00aa88"})
 
     res = _home(api_client)
     assert res.status_code == 200
@@ -726,24 +1030,28 @@ def test_dashboard_home_normalizes_integer_activity_index(
     assert payload["metrics"]["items"]
 
 
-def test_dashboard_status_returns_services(api_client) -> None:
+def test_dashboard_status_returns_services(monkeypatch, tmp_path, api_client) -> None:
+    cache = _dashboard_cache(monkeypatch, tmp_path)
+    activity_path = Path(cache.activity.path).resolve()
     res = api_client.get("/api/dashboard/status")
     assert res.status_code == 200
     payload = res.json()
-    assert isinstance(payload.get("services"), list)
-    assert any(svc.get("name") == "Todoist token" for svc in payload["services"])
-    assert payload["configurableItems"] == []
+    services = {service["name"]: service for service in payload["services"]}
+    assert "Todoist token" in services
+    assert services["Activity cache"]["status"] == "ok"
+    assert services["Activity cache"]["detail"] == payload["activityCache"]
+    assert payload["activityCache"]["path"] == str(activity_path)
+    assert payload["activityCache"]["size"] == activity_path.stat().st_size
+    assert api_client.app.state.dashboard.sync.task is None
 
 
-def test_dashboard_home_includes_urgency_status(monkeypatch, api_client) -> None:
-    _set_dashboard_df(monkeypatch, _single_event_df())
-    monkeypatch.setattr(
-        web_api,
-        "_DASHBOARD_CONFIG_PATH",
-        web_api._REPO_ROOT / "configs" / "dashboard.yaml",
+def test_dashboard_home_includes_urgency_status(api_client, saved_dashboard) -> None:
+    snapshot = saved_dashboard(_single_event_df())
+    api_client.app.state.dashboard_config_path = (
+        REPO_ROOT / "configs" / "dashboard.yaml"
     )
 
-    web_api._state.active_projects = [
+    snapshot.active_projects = [
         make_project(
             project_id="proj-urgency",
             project_entry=make_project_entry(project_id="proj-urgency", name="Urgency"),
@@ -757,7 +1065,7 @@ def test_dashboard_home_includes_urgency_status(monkeypatch, api_client) -> None
             ],
         )
     ]
-    web_api._state.project_colors = {"Urgency": "#44aa66"}
+    snapshot.project_colors = {"Urgency": "#44aa66"}
 
     res = _home(api_client)
 
@@ -780,13 +1088,15 @@ def test_dashboard_home_includes_urgency_status(monkeypatch, api_client) -> None
     assert isinstance(payload["figures"]["activeProjectHierarchy"], dict)
 
 
-def test_dashboard_home_passes_active_and_archived_projects_to_hierarchy(
-    monkeypatch, api_client
+def test_dashboard_home_renders_active_and_archived_main_projects(
+    api_client, saved_dashboard, tmp_path
 ) -> None:
-    _set_dashboard_df(monkeypatch, _single_event_df())
+    parent = make_project(project_id="parent", name="Parent")
     active = make_project(
         project_id="active",
-        project_entry=make_project_entry(project_id="active", name="Active"),
+        project_entry=make_project_entry(
+            project_id="active", name="Active", parent_id="parent"
+        ),
     )
     archived = make_project(
         project_id="archived",
@@ -795,190 +1105,197 @@ def test_dashboard_home_passes_active_and_archived_projects_to_hierarchy(
         ),
         is_archived=True,
     )
-    web_api._state.active_projects = [active]
-    web_api._state.archived_projects = [archived]
-    captured: dict[str, object] = {}
-
-    def _capture_hierarchy(*args, **kwargs):
-        captured["projects"] = args[3]
-        captured["mappings"] = kwargs["project_mappings"]
-        captured["archived_parents"] = kwargs["archived_parent_projects"]
-        return go.Figure()
-
-    monkeypatch.setattr(web_api, "plot_active_project_hierarchy", _capture_hierarchy)
-    monkeypatch.setattr(
-        dashboard_routes, "get_adjusting_mapping", lambda: {"Archived": "Active"}
+    saved_dashboard(
+        _event_df(
+            [
+                {
+                    "date": "2025-01-15",
+                    "id": project_id,
+                    "title": "Task",
+                    "type": "completed",
+                    "parent_project_id": project_id,
+                    "parent_project_name": name,
+                    "root_project_name": "Active",
+                    "task_id": project_id,
+                }
+                for project_id, name in [("active", "Active"), ("archived", "Archived")]
+            ]
+        ),
+        active_projects=[parent, active],
+        archived_projects=[archived],
     )
-    monkeypatch.setattr(
-        dashboard_routes,
-        "get_adjusting_archived_parent_projects",
-        lambda: {"Archived"},
+    id_rule = {"active": {"targetId": "active", "targetName": "Active"}}
+    personal = tmp_path / "personal"
+    personal.mkdir()
+    (personal / "adj_private.py").write_text(
+        render_adjustments_file_content({"Archived": "Active"}, ["Archived"], id_rule),
+        encoding="utf-8",
     )
 
     response = _home(api_client)
 
     assert response.status_code == 200
-    projects = cast(list[object], captured["projects"])
-    assert [getattr(project, "id") for project in projects] == [
-        "active",
-        "archived",
-    ]
-    assert captured["mappings"] == {"Archived": "Active"}
-    assert captured["archived_parents"] == {"Archived"}
+    figure = response.json()["figures"]["activeProjectHierarchy"]["data"][0]
+    levels = dict(zip(figure["ids"], figure["parents"], strict=True))
+    assert levels["active"] == levels["archived"] == "active-projects"
 
 
 def test_stale_ready_state_refreshes_in_background_without_blocking_cached_reads(
     monkeypatch,
+    tmp_path,
 ):
-    import asyncio
-    import time
-    import todometry.web.api_components.dashboard_runtime as runtime
-
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.project_colors = {}
-    state.last_refresh_s = time.time() - 3600
-    monkeypatch.setattr(web_api, "_state", state)
-    monkeypatch.setattr(web_api, "_activity_cache_signature", lambda: None)
+    _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("API_KEY", "")
+    source = runtime.sync_source(demo_mode=False)
+    state = DashboardState()
+    state.snapshot = DashboardSnapshot(
+        df_activity=_single_event_df(), last_refresh_s=time.time() - 3600
+    )
+    monkeypatch.setattr(
+        dashboard_runtime, "_activity_cache_signature", lambda _cache: None
+    )
     refreshed = []
 
-    def refresh(*, demo_mode):
+    def refresh(state, *, source, result):
         refreshed.append(True)
-        state.last_refresh_s = time.time()
+        state.snapshot.last_refresh_s = time.time()
 
-    monkeypatch.setattr(web_api, "_refresh_state_sync", refresh)
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", refresh)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        assert state.refresh_task is not None
-        assert state.df_activity is not None
-        await state.refresh_task
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
+        assert state.sync.task is not None
+        assert state.snapshot.df_activity is not None
+        await state.sync.task
         assert refreshed == [True]
-        await runtime._ensure_state(refresh=False, demo_mode=False)
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
         assert refreshed == [True]
 
     asyncio.run(run())
 
 
-def test_failed_background_refresh_keeps_cached_data_and_throttles_retries(monkeypatch):
-    import asyncio
-    import time
-    import todometry.web.api_components.dashboard_runtime as runtime
+def test_failed_background_refresh_keeps_cached_data_and_throttles_retries(
+    monkeypatch, tmp_path
+):
+    _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("API_KEY", "")
+    source = runtime.sync_source(demo_mode=False)
+    state = DashboardState()
+    state.snapshot = DashboardSnapshot(
+        df_activity=_single_event_df(), last_refresh_s=time.time() - 3600
+    )
+    monkeypatch.setattr(
+        dashboard_runtime, "_activity_cache_signature", lambda _cache: None
+    )
 
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.project_colors = {}
-    state.last_refresh_s = time.time() - 3600
-    monkeypatch.setattr(web_api, "_state", state)
-    monkeypatch.setattr(web_api, "_activity_cache_signature", lambda: None)
-
-    def offline(*, demo_mode):
+    def offline(state, *, source, result):
         raise ConnectionError("offline")
 
-    monkeypatch.setattr(web_api, "_refresh_state_sync", offline)
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", offline)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        task = state.refresh_task
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
+        task = state.sync.task
         await task
-        assert len(state.df_activity) == 1
-        assert "saved data" in state.last_refresh_error
-        await runtime._ensure_state(refresh=False, demo_mode=False)
-        assert state.refresh_task is task
+        assert len(state.snapshot.df_activity) == 1
+        assert state.sync.status_for(source)["dashboardError"] == "Could not update the dashboard."
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
+        assert state.sync.task is task
 
     asyncio.run(run())
 
 
-def test_explicit_refresh_joins_an_existing_background_sync(monkeypatch):
-    import asyncio
-    import todometry.web.api_components.dashboard_runtime as runtime
-
-    state = web_api._DashboardState()
-    monkeypatch.setattr(web_api, "_state", state)
+def test_explicit_refresh_joins_an_existing_background_sync(monkeypatch, tmp_path):
+    _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("API_KEY", "")
+    source = runtime.sync_source(demo_mode=False)
+    state = DashboardState(snapshot=DashboardSnapshot(_single_event_df()))
 
     async def run():
         gate = asyncio.Event()
-        state.refresh_task = asyncio.create_task(gate.wait())
-        runtime._sync_api_globals()
+
+        async def refresh_dashboard(_state, _source, _result):
+            await gate.wait()
+
+        monkeypatch.setattr(dashboard_runtime, "_refresh_dashboard", refresh_dashboard)
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
+        task = state.sync.task
+        assert task is not None
         request = asyncio.create_task(
-            runtime._ensure_state(refresh=True, demo_mode=False)
+            dashboard_runtime.ensure_state(state, refresh=True, source=source)
         )
         await asyncio.sleep(0)
         assert not request.done()
+        assert state.sync.task is task
         gate.set()
         await request
+        assert task.done()
 
     asyncio.run(run())
 
 
 def test_state_refresh_uses_the_runtime_credential_file(monkeypatch, tmp_path):
-    import pytest
-
     env = tmp_path / "runtime" / ".env"
+    env.parent.mkdir()
+    env.write_text("API_KEY=fixture-token\n", encoding="utf-8")
     received = []
 
     class StopAtDatabase:
-        def __init__(self, path):
-            received.append(path)
+        def __init__(self, path, *, api_key):
+            received.append((path, api_key))
             raise RuntimeError("stop before network access")
 
-    monkeypatch.setattr(web_api, "Database", StopAtDatabase)
-    monkeypatch.setattr(web_api, "_resolve_env_path", lambda: env)
-    monkeypatch.setattr(
-        web_api, "_run_async_in_main_loop", lambda coroutine: coroutine.close()
-    )
+    monkeypatch.setattr(dashboard_runtime, "Database", StopAtDatabase)
+    monkeypatch.setenv(str(EnvVar.DATA_DIR), str(env.parent))
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path / "cache"))
+    monkeypatch.setenv("API_KEY", "")
     with pytest.raises(RuntimeError, match="stop before network"):
-        web_api._call_dashboard_runtime("_refresh_state_sync", demo_mode=False)
-    assert received == [str(env)]
+        dashboard_runtime._refresh_state_sync(
+            DashboardState(), source=runtime.sync_source(demo_mode=False), result=None
+        )
+    assert received == [(str(env), "fixture-token")]
 
 
-def test_background_refresh_preserves_partial_sync_warnings(monkeypatch):
-    import asyncio
-    import todometry.web.api_components.dashboard_runtime as runtime
+def test_background_refresh_preserves_partial_sync_warnings(monkeypatch, tmp_path):
+    _dashboard_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("API_KEY", "")
+    source = runtime.sync_source(demo_mode=False)
+    state = DashboardState(snapshot=DashboardSnapshot(_single_event_df()))
 
-    state = web_api._DashboardState()
-    monkeypatch.setattr(web_api, "_state", state)
+    def partial_refresh(state, *, source, result):
+        return "Activity history could not be refreshed."
 
-    def partial_refresh(*, demo_mode):
-        state.last_refresh_error = "Activity history could not be refreshed."
-
-    monkeypatch.setattr(web_api, "_refresh_state_sync", partial_refresh)
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", partial_refresh)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        await runtime._refresh_cached_state(demo_mode=False)
-        assert state.last_refresh_error == "Activity history could not be refreshed."
+        await dashboard_runtime.ensure_state(state, refresh=False, source=source)
+        assert state.sync.task is not None
+        await state.sync.task
+        assert (
+            state.sync.status_for(source)["dashboardError"]
+            == "Activity history could not be refreshed."
+        )
 
     asyncio.run(run())
 
 
-def test_failed_mode_change_does_not_return_data_from_the_previous_mode(monkeypatch):
-    import asyncio
-    import pytest
-    import todometry.web.api_components.dashboard_runtime as runtime
+def test_failed_mode_change_does_not_return_data_from_the_previous_mode(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(str(EnvVar.CACHE_DIR), str(tmp_path))
+    monkeypatch.setenv("API_KEY", "")
+    source = runtime.sync_source(demo_mode=False)
+    state = DashboardState()
+    state.snapshot = DashboardSnapshot(df_activity=_single_event_df(), demo_mode=True)
 
-    state = web_api._DashboardState()
-    state.df_activity = _single_event_df()
-    state.active_projects = []
-    state.demo_mode = True
-    monkeypatch.setattr(web_api, "_state", state)
-
-    def offline(*, demo_mode):
+    def offline(state, *, source, result):
         raise ConnectionError("offline")
 
-    monkeypatch.setattr(web_api, "_refresh_state_sync", offline)
+    monkeypatch.setattr(dashboard_runtime, "_refresh_state_sync", offline)
 
     async def run():
-        monkeypatch.setattr(web_api, "_STATE_LOCK", asyncio.Lock())
-        runtime._sync_api_globals()
-        with pytest.raises(ConnectionError, match="offline"):
-            await runtime._ensure_state(refresh=True, demo_mode=False)
+        with pytest.raises(HTTPException) as error:
+            await dashboard_runtime.ensure_state(state, refresh=True, source=source)
+        assert error.value.status_code == 503
 
     asyncio.run(run())

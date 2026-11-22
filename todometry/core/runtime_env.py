@@ -3,9 +3,13 @@
 from collections.abc import Mapping
 import os
 from pathlib import Path
+from threading import Lock
 
 
 from todometry.core.env import EnvVar
+
+
+runtime_env_lock = Lock()
 
 
 def _sanitize_env_text(value: object) -> str | None:

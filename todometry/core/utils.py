@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, field
 import filecmp
 import time
@@ -14,13 +15,16 @@ from os import getenv
 from os.path import exists
 from pathlib import Path
 from pickle import HIGHEST_PROTOCOL, UnpicklingError
-from typing import Any, Callable, Generic, KeysView, Type, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Generic, KeysView, Type, TypeVar, cast
 from zlib import error as ZlibError
 
 from joblib import dump, load
 from loguru import logger
 
 from todometry.core.env import EnvVar
+
+if TYPE_CHECKING:
+    from todometry.core.types import Event
 
 try:  # pragma: no cover - platform-specific import
     import fcntl
@@ -51,15 +55,12 @@ DEFAULT_CACHE_SUBDIR = Path(".cache") / "todometry"
 CacheStorageSpec = tuple[str, Callable[[], Any]]
 CACHE_STORAGE_REGISTRY: dict[str, CacheStorageSpec] = {
     "activity": ("activity.joblib", set),
+    "activity_coverage": ("activity_coverage.joblib", dict),
     "dashboard_state": ("dashboard_state.joblib", dict),
     "archived_activity_scans": ("archived_activity_scans.joblib", dict),
 }
 RUNTIME_CACHE_FILENAMES: tuple[str, ...] = tuple(
     filename for filename, _default_factory in CACHE_STORAGE_REGISTRY.values()
-)
-RUNTIME_LOG_FILENAMES: tuple[str, ...] = ()
-RUNTIME_MIGRATABLE_FILENAMES: tuple[str, ...] = (
-    RUNTIME_CACHE_FILENAMES + RUNTIME_LOG_FILENAMES
 )
 DEFAULT_LOG_LEVEL = "INFO"
 VALID_LOG_LEVELS = frozenset(
@@ -74,11 +75,13 @@ API_KEY_PLACEHOLDERS = frozenset(
 )
 
 TqdmProgressCallback = Callable[..., None]
+_TQDM_PROGRESS_CALLBACK: ContextVar[TqdmProgressCallback | None] = ContextVar(
+    "tqdm_progress_callback", default=None
+)
 
 
 @dataclass
 class _RuntimeState:
-    tqdm_progress_callback: TqdmProgressCallback | None = None
     runtime_logging_signature: tuple[str | None, str] | None = None
     missing_required_field_warnings: set[tuple[str, str]] = field(default_factory=set)
 
@@ -89,11 +92,12 @@ _LOCAL_STORAGE_LOCKS_GUARD = RLock()
 
 
 def set_tqdm_progress_callback(callback: TqdmProgressCallback | None) -> None:
-    _STATE.tqdm_progress_callback = callback
+    """Set the progress callback for the current execution context."""
+    _TQDM_PROGRESS_CALLBACK.set(callback)
 
 
 def get_tqdm_progress_callback() -> TqdmProgressCallback | None:
-    return _STATE.tqdm_progress_callback
+    return _TQDM_PROGRESS_CALLBACK.get()
 
 
 def report_tqdm_progress(
@@ -107,7 +111,7 @@ def report_tqdm_progress(
     lane_label: str | None = None,
     lane_status: str | None = None,
 ) -> None:
-    callback = _STATE.tqdm_progress_callback
+    callback = get_tqdm_progress_callback()
     if callback is None:
         return
     try:
@@ -483,26 +487,18 @@ class LocalStorage(Generic[T]):
 
 
 class Cache:
+    activity: LocalStorage[set["Event"]]
+    activity_coverage: LocalStorage[dict[str, Any]]
+    dashboard_state: LocalStorage[dict[str, Any]]
+    archived_activity_scans: LocalStorage[dict[str, Any]]
+
     def __init__(self, path: str | None = None):
         self.path = resolve_cache_dir(path)
         Path(self.path).mkdir(parents=True, exist_ok=True)
-        for name, (_filename, default_factory) in CACHE_STORAGE_REGISTRY.items():
-            setattr(self, name, self.storage(name, default_factory))
-
-    def storage(self, name: str, default_factory: Callable[[], T]) -> LocalStorage[T]:
-        registry_entry = CACHE_STORAGE_REGISTRY.get(name)
-        filename = registry_entry[0] if registry_entry else f"{name}.joblib"
-        return LocalStorage(str(Path(self.path) / filename), default_factory)
-
-    def __getattr__(self, name: str) -> LocalStorage[Any]:
-        registry_entry = CACHE_STORAGE_REGISTRY.get(name)
-        if registry_entry is None:
-            raise AttributeError(
-                f"{type(self).__name__!r} object has no attribute {name!r}"
+        for name, (filename, default_factory) in CACHE_STORAGE_REGISTRY.items():
+            setattr(
+                self, name, LocalStorage(str(Path(self.path) / filename), default_factory)
             )
-        storage = self.storage(name, registry_entry[1])
-        setattr(self, name, storage)
-        return storage
 
 
 class Anonymizable(ABC):

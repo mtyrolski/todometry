@@ -1,8 +1,8 @@
 "use client";
 
-import { readJson } from "./adminApi";
+import { readJson, requestJson } from "./adminApi";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DashboardHome, DashboardStatus, Granularity, Health } from "./dashboardData";
+import type { DashboardHome, DashboardStatus, Granularity, Health, HistoryCharts, HistoryRange } from "./dashboardData";
 import type { DashboardProgress } from "../components/ProgressSteps";
 import type { ProjectTimelineData } from "./projectTimeline";
 
@@ -44,27 +44,69 @@ export function useApiHealth(pollMs = 10_000) {
   return { health, loadingHealth, error };
 }
 
-export function useDashboardHome({
-  historyRange,
-  enabled = true
-}: {
-  historyRange?: { beg: string; end: string };
-  enabled?: boolean;
-} = {}) {
+type HistoryRead = {
+  request: string;
+  history: HistoryCharts | null;
+  error?: string;
+};
+
+function historyForRange(history: HistoryCharts | null | undefined, beg: string, end: string) {
+  return history?.range.beg === beg && history.range.end === end ? history : null;
+}
+
+export function useHistoryCharts({ beg, end }: HistoryRange, lastSyncedAt: string | null) {
+  const request = `${beg}:${end}:${lastSyncedAt ?? ""}`;
+  const [read, setRead] = useState<HistoryRead | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const { signal } = controller;
+    const load = async () => {
+      const fallback = "Could not load saved activity";
+      try {
+        const query = new URLSearchParams({ beg, end });
+        const payload = await requestJson<HistoryCharts>(`/api/dashboard/history?${query}`, { signal, cache: "no-store" }, fallback);
+        if (!payload?.range || !historyForRange(payload, beg, end) || !payload.figures) throw new Error(fallback);
+        if (!signal.aborted) setRead({ request, history: payload });
+      } catch (error) {
+        if (signal.aborted) return;
+        const message = error instanceof Error ? error.message : fallback;
+        setRead((previous) => ({
+          request,
+          history: historyForRange(previous?.history, beg, end),
+          error: /invalid json response/i.test(message) ? fallback : message
+        }));
+      }
+    };
+    queueMicrotask(() => {
+      if (!signal.aborted) void load();
+    });
+    return () => controller.abort();
+  }, [beg, end, request]);
+
+  const history = historyForRange(read?.history, beg, end);
+  const loading = read?.request !== request;
+  const error = loading ? null : read?.error ?? null;
+  return {
+    history,
+    loading,
+    error: error && history ? `${error.replace(/\.$/, "")}. Showing the last loaded view.` : error
+  };
+}
+
+export function useDashboardHome({ enabled = true }: { enabled?: boolean } = {}) {
   const [granularity, setGranularity] = useState<Granularity>("W");
   const [weeks, setWeeks] = useState(12);
-  const { beg, end } = historyRange ?? {};
-  const [refreshNonce, setRefreshNonce] = useState<number>(0);
-  const lastRefreshNonce = useRef<number>(0);
   const [retryNonce, setRetryNonce] = useState<number>(0);
   const retryAttempts = useRef<number>(0);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [dashboard, setDashboard] = useState<DashboardHome | null>(null);
-  const lastDashboard = useRef<DashboardHome | null>(null);
+  const hasDashboard = useRef(false);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DashboardProgress | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const refreshing = dashboard?.sync?.state === "running";
 
   useEffect(() => {
     if (!enabled) {
@@ -82,16 +124,8 @@ export function useDashboardHome({
       try {
         setLoadingDashboard(true);
         setDashboardError(null);
-        const shouldRefresh = refreshNonce !== lastRefreshNonce.current;
-        lastRefreshNonce.current = refreshNonce;
-        const qs = new URLSearchParams({ granularity, refresh: shouldRefresh ? "true" : "false" });
-        if (beg || (!shouldRefresh && lastDashboard.current)) qs.set("cached_only", "true");
-        if (beg && end) {
-          qs.set("beg", beg);
-          qs.set("end", end);
-        } else {
-          qs.set("weeks", String(weeks));
-        }
+        const qs = new URLSearchParams({ granularity, weeks: String(weeks) });
+        if (hasDashboard.current) qs.set("cached_only", "true");
         const res = await fetch(`/api/dashboard/home?${qs.toString()}`, { signal: controller.signal });
         const payload = await readJson<DashboardHome>(res);
         if (controller.signal.aborted) return;
@@ -99,7 +133,7 @@ export function useDashboardHome({
           const detail = payload.error ?? (payload as unknown as { detail?: string })?.detail;
           throw new Error(detail ?? `Failed to load dashboard (${res.status})`);
         }
-        lastDashboard.current = payload;
+        hasDashboard.current = true;
         setDashboard(payload);
         setRetrying(false);
         retryAttempts.current = 0;
@@ -110,7 +144,7 @@ export function useDashboardHome({
       } catch (e) {
         if (controller.signal.aborted) return;
         const message = e instanceof Error ? e.message : "Failed to load dashboard";
-        if (!beg && !lastDashboard.current && isRetryableFetchError(message) && retryAttempts.current < DASHBOARD_RETRY_LIMIT) {
+        if (!hasDashboard.current && isRetryableFetchError(message) && retryAttempts.current < DASHBOARD_RETRY_LIMIT) {
           retryAttempts.current += 1;
           setRetrying(true);
           setDashboardError("Dashboard API is starting. Retrying shortly...");
@@ -123,7 +157,8 @@ export function useDashboardHome({
           return;
         }
         setRetrying(false);
-        setDashboardError(lastDashboard.current ? `${message}. Showing the last loaded view.` : message);
+        const displayMessage = /invalid json response/i.test(message) ? "Could not load dashboard data" : message;
+        setDashboardError(hasDashboard.current ? `${displayMessage}. Showing the last loaded view.` : displayMessage);
       } finally {
         if (!controller.signal.aborted) setLoadingDashboard(false);
       }
@@ -138,15 +173,15 @@ export function useDashboardHome({
         retryTimer.current = null;
       }
     };
-  }, [enabled, granularity, weeks, historyRange, beg, end, refreshNonce, retryNonce]);
+  }, [enabled, granularity, weeks, retryNonce]);
 
   useEffect(() => {
-    if (!enabled || beg || !dashboard?.refreshing || loadingDashboard || dashboardError) return;
+    if (!enabled || !refreshing || loadingDashboard || dashboardError) return;
     const timer = setTimeout(() => setRetryNonce((value) => value + 1), 2000);
     return () => clearTimeout(timer);
-  }, [enabled, beg, dashboard?.refreshing, loadingDashboard, dashboardError]);
+  }, [enabled, refreshing, loadingDashboard, dashboardError]);
 
-  const shouldPollProgress = enabled && !beg && !dashboard &&
+  const shouldPollProgress = enabled && !dashboard &&
     (loadingDashboard || retrying || !dashboardError);
 
   useEffect(() => {
@@ -195,19 +230,17 @@ export function useDashboardHome({
     } satisfies DashboardProgress;
   }, [progress, shouldPollProgress]);
 
-  const refresh = () => setRefreshNonce((value) => value + 1);
-
   return {
     dashboard,
     loadingDashboard,
     dashboardError,
     progressDisplay,
+    refreshing,
     retrying,
     granularity,
     setGranularity,
     weeks,
-    setWeeks,
-    refresh
+    setWeeks
   };
 }
 
@@ -221,8 +254,7 @@ export function useDashboardStatus({ pollMs = 30_000 }: { pollMs?: number } = {}
     const load = async () => {
       try {
         setLoadingStatus(true);
-        const qs = new URLSearchParams({ refresh: statusRefreshNonce ? "true" : "false" });
-        const res = await fetch(`/api/dashboard/status?${qs.toString()}`, { signal: controller.signal });
+        const res = await fetch("/api/dashboard/status", { signal: controller.signal, cache: "no-store" });
         if (!res.ok) throw new Error("status");
         const payload = await readJson<DashboardStatus>(res);
         setStatus(payload);

@@ -1,16 +1,18 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
+import pytest
 
 from tests.factories import make_project, make_task
+from todometry.dashboard._plot_common import apply_date_axis_viewport
 from todometry.web.dashboard_payload import (
     add_plot_event_markers,
-    apply_date_axis_viewport,
     compute_plot_history_beg,
     FIRE_TASK_LABEL,
     evaluate_urgency_status,
     extract_metrics_dict,
+    normalize_activity_df,
     normalize_plot_events,
 )
 
@@ -68,6 +70,32 @@ def test_scrollable_date_axis_keeps_history_with_viewport() -> None:
     assert history_beg == pd.Timestamp("2024-01-01").to_pydatetime()
     assert fig.layout.xaxis.range[0] == pd.Timestamp("2024-12-15").to_pydatetime()
     assert fig.layout.xaxis.rangeslider.visible is True
+
+
+@pytest.mark.parametrize("use_date_index", [False, True])
+def test_normalize_activity_df_preserves_legacy_and_offset_dates(use_date_index: bool):
+    frame = pd.DataFrame(
+        {
+            "date": [
+                datetime(2025, 1, 15, 20, tzinfo=timezone(timedelta(hours=2))),
+                datetime(2025, 1, 15, 12),
+                "invalid",
+            ],
+            "id": ["latest", "earliest", "invalid"],
+        }
+    )
+    if use_date_index:
+        frame = frame.set_index("date")
+
+    normalized = normalize_activity_df(frame)
+
+    assert list(normalized["id"]) == ["earliest", "latest"]
+    assert list(normalized.index) == [
+        datetime(2025, 1, 15, 12),
+        datetime(2025, 1, 15, 18),
+    ]
+    if not use_date_index:
+        assert list(normalized["date"]) == list(normalized.index)
 
 
 def test_plot_events_are_normalized_and_added_as_vertical_markers() -> None:

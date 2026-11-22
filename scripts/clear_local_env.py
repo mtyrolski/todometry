@@ -9,7 +9,7 @@ from pathlib import Path
 from collections.abc import Sequence
 
 from todometry.core.env import EnvVar
-from todometry.core.utils import RUNTIME_MIGRATABLE_FILENAMES, resolve_cache_dir
+from todometry.core.utils import RUNTIME_CACHE_FILENAMES, resolve_cache_dir
 
 
 def _resolve_data_dir() -> Path:
@@ -43,7 +43,7 @@ def clear_local_env() -> list[Path]:
     ]
 
     for root in roots:
-        for filename in RUNTIME_MIGRATABLE_FILENAMES:
+        for filename in RUNTIME_CACHE_FILENAMES:
             cleanup_targets.append(root / filename)
 
     removed: list[Path] = []

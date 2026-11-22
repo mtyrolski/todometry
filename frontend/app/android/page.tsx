@@ -9,7 +9,7 @@ import { MobilePlotCard } from "../components/MobilePlotCard";
 import { PlotCard } from "../components/PlotCard";
 import { StatCard } from "../components/StatCard";
 import { DeferredPlot } from "./DeferredPlot";
-import { ProjectGrouping } from "./ProjectGrouping";
+import { MobileProjectMappingSetup, ProjectGrouping } from "./ProjectGrouping";
 import { PLOT_HELP } from "../lib/dashboardCopy";
 import {
   command,
@@ -207,7 +207,7 @@ function ProjectTimeline({ model, ui, patch }: {
             <h3 style={{ overflowWrap: "anywhere" }}>{selected.name}</h3>
             {selected.parentId && <p className="muted tiny">Parent project: {projects.find((project) => project.id === selected.parentId)?.name ?? "Unknown project"}</p>}
             {!visible.some((project) => project.id === selected.id) && <p>Selected project is outside the current date range.</p>}
-            <p>{selected.metadataKnown === false ? "Status unavailable" : selected.archived ? "Archived" : "Active"} · {selected.openTasks ?? tasks.length} open tasks</p>
+            <p>{selected.metadataKnown === false ? "Status unavailable" : selected.archived ? "Archived" : "Active"} · {tasks.length} open tasks</p>
             <p className="muted tiny">{selected.createdAt ? `Earliest known start: ${selected.createdAt}${selected.createdAtSource === "activity" ? " (first recorded activity)" : ""}.` : "Start date unavailable."} {selected.metadataKnown === false ? "Project status is unknown." : selected.archived ? selected.archivedAt ? `Archived: ${selected.archivedAt}.` : "Archive date unavailable; the last observed activity is not necessarily the archive date." : "Project is ongoing."}</p>
             {!model.historyAvailable || !detailAvailable ? <p>Activity details are unavailable.</p> : <>
               <p><strong>{totals.completions}</strong> recorded completions · <strong>{totals.events}</strong> recorded activity events</p>
@@ -238,6 +238,7 @@ export default function AndroidDashboard() {
   const [storageInvalid, setStorageInvalid] = useState(false);
   const [persist, setPersist] = useState(false);
   const [controlVisited, setControlVisited] = useState(false);
+  const [mappingSetup, setMappingSetup] = useState<"waiting" | "open" | null>(null);
   const [habitLimit, setHabitLimit] = useState(20);
   const [projectLimits, setProjectLimits] = useState(() => new Map<string, number>());
   const [, refreshDate] = useState(0);
@@ -288,6 +289,14 @@ export default function AndroidDashboard() {
       setToken("");
     }
   }, [state?.message]);
+  const mappingAvailable = Boolean(state?.connected && state.model && !state.demo);
+  const initialMappingOpen = mappingSetup === "open" && mappingAvailable;
+  const busy = Boolean(state?.loading || state?.syncing);
+  useEffect(() => {
+    if (mappingSetup === "waiting" && mappingAvailable && !busy) {
+      setMappingSetup("open");
+    }
+  }, [mappingSetup, mappingAvailable, busy]);
   useEffect(() => {
     const back = () => {
       const current = currentUi.current;
@@ -370,7 +379,6 @@ export default function AndroidDashboard() {
       taskCounts: taskCountsFigure(model, ui.range),
     };
   }, [model, ui.tab, ui.range, ui.paceWindow, ui.lifespanAll]);
-  const busy = state?.loading || state?.syncing;
   const { matches, tasksByProject } = useMemo(() => {
     const matches: MobileModel["tasks"] = [];
     const tasksByProject = new Map<string, MobileModel["tasks"]>();
@@ -458,6 +466,7 @@ export default function AndroidDashboard() {
       return;
     }
     setError("");
+    if (!state?.connected || !state.model || state.demo) setMappingSetup("waiting");
     command("sync", token.trim());
   };
   const disconnect = () => {
@@ -466,6 +475,7 @@ export default function AndroidDashboard() {
         "Disconnect and remove this account's saved data from the phone?",
       )
     ) {
+      setMappingSetup(null);
       command("disconnect");
       try {
         localStorage.removeItem("todoist-ui");
@@ -579,6 +589,14 @@ export default function AndroidDashboard() {
       ) : null}
       {!state && !error && <p className="muted">Opening dashboard…</p>}
 
+      {initialMappingOpen && model && (
+        <div className="setupOverlay" role="dialog" aria-modal="true" aria-label="Project mapping">
+          <div className="setupPanel">
+            <MobileProjectMappingSetup model={model} busy={busy} firstRun onClose={() => setMappingSetup(null)} />
+          </div>
+        </div>
+      )}
+
       {state && (!model || ui.tab === "Control Panel") && (
         <section className="card">
           <header className="cardHeader">
@@ -640,7 +658,7 @@ export default function AndroidDashboard() {
       )}
       {state && (controlVisited || ui.tab === "Control Panel") && (
         <div hidden={ui.tab !== "Control Panel"}>
-          <ProjectGrouping model={model ?? null} enabled={Boolean(state.connected && model && !state.demo)} busy={Boolean(busy)} message={state.message} draft={ui.groupingDraft} onDraftChange={(draft) => patch({ groupingDraft: draft })} />
+          <ProjectGrouping model={model ?? null} enabled={mappingAvailable} busy={busy} visible={ui.tab === "Control Panel" && !initialMappingOpen} message={state.message} draft={ui.groupingDraft} onDraftChange={(draft) => patch({ groupingDraft: draft })} />
           <DashboardSettings
             request={mobileSettingsRequest}
             draftStorageKey={SETTINGS_DRAFT_KEY}
