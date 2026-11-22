@@ -177,6 +177,8 @@ def test_guided_project_mapping_roundtrips_project_ids_and_preserves_settings(
 
     bad = {"targetId": "missing-target", "targetName": "Gone"}
     original = path.read_bytes()
+    assert api_client.put(endpoint).status_code == 422
+    assert path.read_bytes() == original
     assert (
         api_client.put(endpoint, json={"projectMappings": {"child": bad}}).status_code
         == 400

@@ -130,7 +130,7 @@ async def admin_save_project_adjustments(
     request: Request,
     file: str,
     refresh: bool = False,
-    payload: dict[str, Any] = Body(default_factory=dict),
+    payload: dict[str, Any] = Body(...),
 ) -> dict[str, Any]:
     """Save named rules or apply an individual-rule patch to the selected file."""
 
