@@ -22,10 +22,22 @@ test.beforeEach(async ({ page }) => {
   } }));
 });
 
-test("a failed background reload keeps the last loaded counts", async ({ page }) => {
+test("background reloads recover from temporary errors and keep the last loaded counts", async ({ page }) => {
+  await page.clock.install();
+  let cachedReads = 0;
   await page.route("**/api/dashboard/home?**", (route) => {
     if (new URL(route.request().url()).searchParams.get("cached_only") === "true") {
-      return route.fulfill({ status: 500, contentType: "text/plain", body: "Internal Server Error" });
+      cachedReads++;
+      if (cachedReads === 1) {
+        return route.fulfill({ status: 500, contentType: "text/plain", body: "Internal Server Error" });
+      }
+      if (cachedReads === 2) {
+        return route.fulfill({ status: 503, json: { detail: "Dashboard temporarily unavailable" } });
+      }
+      return route.fulfill({ json: {
+        ...home, sync: finishedSync,
+        metrics: { ...home.metrics, items: [{ ...home.metrics.items[0], value: 350 }] }
+      } });
     }
     return route.fulfill({ json: {
       ...home, sync: { ...runningSync, dashboardError: "Activity history is from saved data." }
@@ -35,9 +47,35 @@ test("a failed background reload keeps the last loaded counts", async ({ page })
   await expect(page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: /multiplication/i })).toHaveCount(0);
   await expect(page.getByText("349", { exact: true })).toBeVisible();
   await expect(page.getByText("Activity history is from saved data. Showing saved data.", { exact: true })).toBeVisible();
+  await page.clock.fastForward(2_000);
   await expect(page.getByText("Could not load dashboard data. Showing the last loaded view.", { exact: true })).toBeVisible();
   await expect(page.getByText("Syncing in the background…", { exact: true })).toHaveCount(0);
   await expect(page.getByText("349", { exact: true })).toBeVisible();
+
+  await page.clock.fastForward(2_500);
+  await expect(page.getByText("Dashboard temporarily unavailable. Showing the last loaded view.", { exact: true })).toBeVisible();
+  await expect(page.getByText("349", { exact: true })).toBeVisible();
+
+  await page.clock.fastForward(2_500);
+  await expect(page.getByText("350", { exact: true })).toBeVisible();
+  await expect(page.getByText("Showing the last loaded view.")).toHaveCount(0);
+  await expect(page.getByText("Syncing in the background…", { exact: true })).toHaveCount(0);
+  await page.clock.fastForward(10_000);
+  expect(cachedReads).toBe(3);
+});
+
+test("Overview shows a startup error without repeatedly launching a refresh", async ({ page }) => {
+  await page.clock.install();
+  let reads = 0;
+  const detail = "Could not load the dashboard. Check your Todoist token and try again from Activity History.";
+  await page.route("**/api/dashboard/home?**", (route) => {
+    reads++;
+    return route.fulfill({ status: 503, json: { detail } });
+  });
+  await page.goto("/");
+  await expect(page.getByText(detail, { exact: true })).toBeVisible();
+  await page.clock.fastForward(10_000);
+  expect(reads).toBe(1);
 });
 
 test("Refresh data opens Activity History and a failed sync can be retried with saved data visible", async ({ page }) => {

@@ -8,6 +8,7 @@ import type { ProjectTimelineData } from "./projectTimeline";
 
 const DASHBOARD_RETRY_LIMIT = 300;
 const DASHBOARD_RETRY_DELAY_MS = 2500;
+const DASHBOARD_POLL_DELAY_MS = 2000;
 
 function isRetryableFetchError(message: string): boolean {
   return /invalid json response|failed to fetch|networkerror|socket hang up|econnrefused|econnreset|timed out|timeout/i.test(
@@ -97,11 +98,8 @@ export function useHistoryCharts({ beg, end }: HistoryRange, lastSyncedAt: strin
 export function useDashboardHome({ enabled = true }: { enabled?: boolean } = {}) {
   const [granularity, setGranularity] = useState<Granularity>("W");
   const [weeks, setWeeks] = useState(12);
-  const [retryNonce, setRetryNonce] = useState<number>(0);
-  const retryAttempts = useRef<number>(0);
-  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [dashboard, setDashboard] = useState<DashboardHome | null>(null);
-  const hasDashboard = useRef(false);
+  const latestDashboard = useRef<DashboardHome | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DashboardProgress | null>(null);
@@ -109,77 +107,68 @@ export function useDashboardHome({ enabled = true }: { enabled?: boolean } = {})
   const refreshing = dashboard?.sync?.state === "running";
 
   useEffect(() => {
+    setDashboardError(null);
+    setRetrying(false);
     if (!enabled) {
       setLoadingDashboard(false);
-      setDashboardError(null);
-      setRetrying(false);
-      if (retryTimer.current) {
-        clearTimeout(retryTimer.current);
-        retryTimer.current = null;
-      }
       return;
     }
     const controller = new AbortController();
+    const { signal } = controller;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+
     const load = async () => {
+      if (signal.aborted) return;
+      const previous = latestDashboard.current;
+      let status = 0;
       try {
         setLoadingDashboard(true);
-        setDashboardError(null);
         const qs = new URLSearchParams({ granularity, weeks: String(weeks) });
-        if (hasDashboard.current) qs.set("cached_only", "true");
-        const res = await fetch(`/api/dashboard/home?${qs.toString()}`, { signal: controller.signal });
-        const payload = await readJson<DashboardHome>(res);
-        if (controller.signal.aborted) return;
-        if (!res.ok || payload.error) {
-          const detail = payload.error ?? (payload as unknown as { detail?: string })?.detail;
-          throw new Error(detail ?? `Failed to load dashboard (${res.status})`);
+        if (previous) qs.set("cached_only", "true");
+        const response = await fetch(`/api/dashboard/home?${qs}`, { signal });
+        status = response.status;
+        const payload = await readJson<DashboardHome & { detail?: string }>(response);
+        if (signal.aborted) return;
+        if (!response.ok || payload.error) {
+          throw new Error(payload.error ?? payload.detail ?? `Failed to load dashboard (${response.status})`);
         }
-        hasDashboard.current = true;
+        latestDashboard.current = payload;
         setDashboard(payload);
+        setDashboardError(null);
         setRetrying(false);
-        retryAttempts.current = 0;
-        if (retryTimer.current) {
-          clearTimeout(retryTimer.current);
-          retryTimer.current = null;
+        failures = 0;
+        if (payload.sync?.state === "running") {
+          timer = setTimeout(load, DASHBOARD_POLL_DELAY_MS);
         }
       } catch (e) {
-        if (controller.signal.aborted) return;
+        if (signal.aborted) return;
         const message = e instanceof Error ? e.message : "Failed to load dashboard";
-        if (!hasDashboard.current && isRetryableFetchError(message) && retryAttempts.current < DASHBOARD_RETRY_LIMIT) {
-          retryAttempts.current += 1;
+        const transient = isRetryableFetchError(message) || (previous !== null && status >= 500);
+        const canRetry = transient && failures < DASHBOARD_RETRY_LIMIT &&
+          (!previous || previous.sync?.state === "running");
+        if (canRetry) {
+          failures += 1;
+          timer = setTimeout(load, DASHBOARD_RETRY_DELAY_MS);
+        }
+        if (!previous && canRetry) {
           setRetrying(true);
           setDashboardError("Dashboard API is starting. Retrying shortly...");
-          if (retryTimer.current) {
-            clearTimeout(retryTimer.current);
-          }
-          retryTimer.current = setTimeout(() => {
-            setRetryNonce((value) => value + 1);
-          }, DASHBOARD_RETRY_DELAY_MS);
-          return;
+        } else {
+          setRetrying(false);
+          const displayMessage = /invalid json response/i.test(message) ? "Could not load dashboard data" : message;
+          setDashboardError(previous ? `${displayMessage}. Showing the last loaded view.` : displayMessage);
         }
-        setRetrying(false);
-        const displayMessage = /invalid json response/i.test(message) ? "Could not load dashboard data" : message;
-        setDashboardError(hasDashboard.current ? `${displayMessage}. Showing the last loaded view.` : displayMessage);
       } finally {
-        if (!controller.signal.aborted) setLoadingDashboard(false);
+        if (!signal.aborted) setLoadingDashboard(false);
       }
     };
-    queueMicrotask(() => {
-      if (!controller.signal.aborted) void load();
-    });
+    queueMicrotask(load);
     return () => {
       controller.abort();
-      if (retryTimer.current) {
-        clearTimeout(retryTimer.current);
-        retryTimer.current = null;
-      }
+      clearTimeout(timer);
     };
-  }, [enabled, granularity, weeks, retryNonce]);
-
-  useEffect(() => {
-    if (!enabled || !refreshing || loadingDashboard || dashboardError) return;
-    const timer = setTimeout(() => setRetryNonce((value) => value + 1), 2000);
-    return () => clearTimeout(timer);
-  }, [enabled, refreshing, loadingDashboard, dashboardError]);
+  }, [enabled, granularity, weeks]);
 
   const shouldPollProgress = enabled && !dashboard &&
     (loadingDashboard || retrying || !dashboardError);
